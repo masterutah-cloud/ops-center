@@ -1,0 +1,1196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Ops Center</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/pdfjs-dist@3.11.174/legacy/build/pdf.min.js"></script>
+<style>
+  body { margin: 0; }
+  ::-webkit-scrollbar { height: 8px; width: 8px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+const STATUSES = ["Estimate", "Scheduled", "In Progress", "Punch List", "Complete"];
+const STATUS_COLOR = {
+  "Estimate": "#5B6470", "Scheduled": "#2B5D8C", "In Progress": "#D9A02E",
+  "Punch List": "#E2600C", "Complete": "#4A7856",
+};
+const APPT_TYPES = ["Site Visit", "Inspection", "Install", "Client Meeting", "Delivery"];
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const fmtMoney = (n) => "$" + (Number(n) || 0).toLocaleString(undefined, { maximumFractionDigits: 0 });
+const fmtDate = (d) => {
+  if (!d) return "—";
+  const dt = new Date(d + "T00:00:00");
+  return isNaN(dt) ? d : dt.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+};
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
+// ---------- API layer (this is the whole point of the rewrite: real HTTP
+// status codes mean "empty" and "broken" are never ambiguous again) ----------
+async function apiLoad() {
+  const res = await fetch("/api/jobs");
+  if (!res.ok) throw new Error("load failed: " + res.status);
+  return await res.json();
+}
+async function apiSave(jobs) {
+  const res = await fetch("/api/jobs", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(jobs),
+  });
+  if (!res.ok) throw new Error("save failed: " + res.status);
+}
+const RETRY_SCHEDULE = [2000, 4000, 8000, 15000];
+
+// ---------- Takeoff geometry (verified separately with unit tests before wiring into the UI) ----------
+function polylineLength(points) {
+  let total = 0;
+  for (let i = 1; i < points.length; i++) {
+    const dx = points[i].x - points[i - 1].x, dy = points[i].y - points[i - 1].y;
+    total += Math.sqrt(dx * dx + dy * dy);
+  }
+  return total;
+}
+function polygonArea(points) {
+  let sum = 0;
+  const n = points.length;
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    sum += points[i].x * points[j].y - points[j].x * points[i].y;
+  }
+  return Math.abs(sum) / 2;
+}
+
+// Renders page 1 of a PDF (fetched from its uploaded URL) to a data URL so it can be
+// displayed and measured exactly like an uploaded image. Multi-page plan sets only use
+// page 1 for now — upload each sheet as a separate file if you need more than one page.
+async function renderPdfFirstPageToDataUrl(url) {
+  if (!window.pdfjsLib) throw new Error("PDF viewer library didn't load — check your connection and reload.");
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://unpkg.com/pdfjs-dist@3.11.174/legacy/build/pdf.worker.min.js";
+  const pdf = await window.pdfjsLib.getDocument(url).promise;
+  const page = await pdf.getPage(1);
+  const viewport = page.getViewport({ scale: 2 });
+  const canvas = document.createElement("canvas");
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+  return canvas.toDataURL("image/png");
+}
+
+const EXPENSE_CATEGORIES = ["Labor", "Materials", "Other"];
+const EXPENSE_COLOR = { "Labor": "#2B5D8C", "Materials": "#D9A02E", "Other": "#8A8577" };
+
+// Uploads a file to the server (which forwards it to the configured bucket).
+// Returns { key, url, name, type } on success, or throws with a friendly message.
+async function apiUpload(file) {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch("/api/upload", { method: "POST", body: form });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Upload failed");
+  return data;
+}
+
+// ---------- tiny inline icon set (no external icon deps) ----------
+const Icon = ({ d, size = 14, color = "currentColor" }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{d}</svg>
+);
+const IPlus = (p) => <Icon {...p} d={<><path d="M12 5v14M5 12h14"/></>} />;
+const IX = (p) => <Icon {...p} d={<><path d="M18 6 6 18M6 6l12 12"/></>} />;
+const IMap = (p) => <Icon {...p} d={<><path d="M12 22s7-7.4 7-12a7 7 0 1 0-14 0c0 4.6 7 12 7 12Z"/><circle cx="12" cy="10" r="2.5"/></>} />;
+const IChevron = (p) => <Icon {...p} d={<path d="m9 18 6-6-6-6"/>} />;
+const ITrash = (p) => <Icon {...p} d={<><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></>} />;
+const ICheck = (p) => <Icon {...p} d={<path d="M20 6 9 17l-5-5"/>} />;
+const ITrend = (p) => <Icon {...p} d={<><path d="m3 17 6-6 4 4 8-8"/><path d="M17 7h4v4"/></>} />;
+const IAlert = (p) => <Icon {...p} d={<><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></>} />;
+const ILoader = (p) => <Icon {...p} d={<path d="M21 12a9 9 0 1 1-6.2-8.6"/>} />;
+const IList = (p) => <Icon {...p} d={<><path d="M3 6h.01M3 12h.01M3 18h.01M8 6h13M8 12h13M8 18h13"/></>} />;
+const IGrid = (p) => <Icon {...p} d={<><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></>} />;
+const ICal = (p) => <Icon {...p} d={<><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></>} />;
+const IDollar = (p) => <Icon {...p} d={<><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></>} />;
+const IFile = (p) => <Icon {...p} d={<><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></>} />;
+const IDownload = (p) => <Icon {...p} d={<><path d="M12 3v12m0 0-4-4m4 4 4-4"/><path d="M4 21h16"/></>} />;
+const IUpload = (p) => <Icon {...p} d={<><path d="M12 21V9m0 0 4 4m-4-4-4 4"/><path d="M4 3h16"/></>} />;
+const ICamera = (p) => <Icon {...p} d={<><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2Z"/><circle cx="12" cy="13" r="4"/></>} />;
+const IPaperclip = (p) => <Icon {...p} d={<path d="M21 12.5 12.5 21a5 5 0 0 1-7-7L14 5.5a3.5 3.5 0 0 1 5 5L10.5 19a2 2 0 0 1-3-3L15 8.5"/>} />;
+const IRuler = (p) => <Icon {...p} d={<><path d="m16.5 21.5-14-14a2 2 0 0 1 0-2.8L4.7 2.5a2 2 0 0 1 2.8 0l14 14a2 2 0 0 1 0 2.8l-2.2 2.2a2 2 0 0 1-2.8 0Z"/><path d="m7.5 10.5 2-2M10.5 13.5l2-2M13.5 16.5l2-2"/></>} />;
+
+function Gauge({ value = 0, color = "#2B5D8C" }) {
+  const pct = Math.max(0, Math.min(100, value));
+  return (
+    <div>
+      <div style={{ position: "relative", height: 10, background: "#E4E1D6", borderRadius: 2, overflow: "hidden", border: "1px solid #D7D3C5" }}>
+        <div style={{ position: "absolute", inset: 0, width: pct + "%", background: color, transition: "width .3s ease" }} />
+      </div>
+      <div style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] mt-1 text-[#5B6470]">{pct}% complete</div>
+    </div>
+  );
+}
+function StatusStamp({ status }) {
+  const color = STATUS_COLOR[status] || "#5B6470";
+  return (
+    <div style={{ color, borderColor: color, fontFamily: "'Oswald', sans-serif", transform: "rotate(-7deg)" }}
+      className="absolute top-2 right-2 border-2 rounded-sm px-1.5 py-0.5 text-[9px] tracking-widest uppercase font-semibold opacity-80 select-none">
+      {status}
+    </div>
+  );
+}
+function PunchHole() {
+  return <div className="absolute top-2 left-2 w-3 h-3 rounded-full" style={{ background: "#EEEDE6", border: "1px solid #C9C5B8", boxShadow: "inset 0 1px 2px rgba(0,0,0,0.25)" }} />;
+}
+function EmptyState({ icon: Ic, title, subtitle, actionLabel, onAction }) {
+  return (
+    <div className="border-2 border-dashed rounded-sm p-8 text-center" style={{ borderColor: "#C9C5B8" }}>
+      <div className="flex justify-center mb-2" style={{ color: "#8A8577" }}><Ic size={22} /></div>
+      <div className="font-semibold text-sm" style={{ color: "#1A2332" }}>{title}</div>
+      {subtitle && <div className="text-xs mt-1" style={{ color: "#8A8577" }}>{subtitle}</div>}
+      {actionLabel && (
+        <button onClick={onAction} className="mt-4 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wide rounded-sm text-white" style={{ background: "#E2600C" }}>
+          <IPlus size={14} /> {actionLabel}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function JobCard({ job, onOpen }) {
+  const openTasks = (job.tasks || []).filter(t => !t.done).length;
+  const overdue = job.dueDate && job.dueDate < todayStr() && job.status !== "Complete";
+  return (
+    <button onClick={() => onOpen(job.id)}
+      className="relative w-full text-left bg-white border-2 border-dashed rounded-sm p-3.5 pt-6 mb-3 hover:shadow-md transition-shadow"
+      style={{ borderColor: overdue ? "#E2600C" : "#C9C5B8" }}>
+      <PunchHole />
+      <StatusStamp status={job.status} />
+      <div style={{ fontFamily: "'Oswald', sans-serif" }} className="uppercase text-[13px] font-semibold leading-tight pr-16">{job.name || "Untitled job"}</div>
+      <div className="text-xs mt-0.5" style={{ color: "#5B6470" }}>{job.client || "No client set"}</div>
+      {job.address && (
+        <div className="flex items-center gap-1 text-[11px] mt-2" style={{ color: "#8A8577" }}>
+          <IMap size={11} /> <span className="truncate">{job.address}</span>
+        </div>
+      )}
+      <div className="mt-3"><Gauge value={job.progress || 0} color={STATUS_COLOR[job.status]} /></div>
+      <div className="flex items-center justify-between mt-3 pt-2 border-t" style={{ borderColor: "#EEEDE6" }}>
+        <div style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px]">{fmtMoney(job.estimate?.amount)}</div>
+        <div className="flex items-center gap-2 text-[11px]" style={{ color: overdue ? "#E2600C" : "#8A8577" }}>
+          {openTasks > 0 && <span className="flex items-center gap-0.5"><IList size={11} />{openTasks}</span>}
+          <span>{overdue ? "Overdue" : fmtDate(job.dueDate)}</span>
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function NewJobModal({ onClose, onCreate }) {
+  const [form, setForm] = useState({ name: "", client: "", address: "", status: "Estimate", startDate: todayStr(), dueDate: "", estimateAmount: "" });
+  const set = (k) => (e) => setForm(f => ({ ...f, [k]: e.target.value }));
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(26,35,50,0.55)" }}>
+      <div className="bg-white rounded-sm w-full max-w-md p-5 max-h-[85vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-4">
+          <h3 style={{ fontFamily: "'Oswald', sans-serif" }} className="uppercase font-semibold text-base">New job</h3>
+          <button onClick={onClose}><IX size={18} /></button>
+        </div>
+        <div className="space-y-3">
+          <div><label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Job name</label>
+            <input value={form.name} onChange={set("name")} placeholder="e.g. Maple St. Kitchen Remodel" className="w-full mt-1 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} /></div>
+          <div><label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Client</label>
+            <input value={form.client} onChange={set("client")} placeholder="Client name" className="w-full mt-1 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} /></div>
+          <div><label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Address</label>
+            <input value={form.address} onChange={set("address")} placeholder="Job site address" className="w-full mt-1 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} /></div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Start date</label>
+              <input type="date" value={form.startDate} onChange={set("startDate")} className="w-full mt-1 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} /></div>
+            <div><label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Due date</label>
+              <input type="date" value={form.dueDate} onChange={set("dueDate")} className="w-full mt-1 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} /></div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Status</label>
+              <select value={form.status} onChange={set("status")} className="w-full mt-1 px-2.5 py-2 border rounded-sm text-sm bg-white" style={{ borderColor: "#C9C5B8" }}>
+                {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+              </select></div>
+            <div><label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Estimate ($)</label>
+              <input type="number" value={form.estimateAmount} onChange={set("estimateAmount")} placeholder="0" className="w-full mt-1 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} /></div>
+          </div>
+        </div>
+        <div className="flex gap-2 mt-5">
+          <button onClick={onClose} className="flex-1 px-3 py-2 text-sm font-semibold rounded-sm border" style={{ borderColor: "#C9C5B8", color: "#5B6470" }}>Cancel</button>
+          <button onClick={() => {
+            if (!form.name.trim()) return;
+            onCreate({
+              id: uid(), name: form.name.trim(), client: form.client.trim(), address: form.address.trim(),
+              status: form.status, startDate: form.startDate, dueDate: form.dueDate, progress: 0,
+              estimate: { amount: Number(form.estimateAmount) || 0, status: "Draft" },
+              tasks: [], appointments: [], notes: "", expenses: [], files: [], takeoffSheets: [], takeoffMeasurements: [],
+            });
+          }} className="flex-1 px-3 py-2 text-sm font-semibold rounded-sm text-white uppercase tracking-wide" style={{ background: "#E2600C" }}>
+            Create job
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function JobModal({ job, onClose, onUpdate, onDelete }) {
+  const [tab, setTab] = useState("details");
+  const [newTask, setNewTask] = useState("");
+  const [newTaskAssignee, setNewTaskAssignee] = useState("");
+  const [newAppt, setNewAppt] = useState({ title: "", date: todayStr(), time: "09:00", type: "Site Visit" });
+  const update = (patch) => onUpdate({ ...job, ...patch });
+  const addTask = () => {
+    if (!newTask.trim()) return;
+    update({ tasks: [...(job.tasks || []), { id: uid(), text: newTask.trim(), done: false, assignee: newTaskAssignee.trim(), due: "" }] });
+    setNewTask(""); setNewTaskAssignee("");
+  };
+  const toggleTask = (id) => update({ tasks: job.tasks.map(t => t.id === id ? { ...t, done: !t.done } : t) });
+  const removeTask = (id) => update({ tasks: job.tasks.filter(t => t.id !== id) });
+  const addAppt = () => {
+    if (!newAppt.title.trim()) return;
+    update({ appointments: [...(job.appointments || []), { id: uid(), ...newAppt, title: newAppt.title.trim() }] });
+    setNewAppt({ title: "", date: todayStr(), time: "09:00", type: "Site Visit" });
+  };
+  const removeAppt = (id) => update({ appointments: job.appointments.filter(a => a.id !== id) });
+
+  // ---- P&L: expenses + project files ----
+  const [newExpense, setNewExpense] = useState({ category: "Labor", description: "", amount: "", date: todayStr() });
+  const [uploadingExpenseReceipt, setUploadingExpenseReceipt] = useState(false);
+  const [uploadingFile, setUploadingFile] = useState(false);
+  const [uploadError, setUploadError] = useState("");
+  const expenseReceiptInputRef = useRef(null);
+  const projectFileInputRef = useRef(null);
+
+  const addExpense = () => {
+    if (!newExpense.description.trim() || !newExpense.amount) return;
+    update({
+      expenses: [...(job.expenses || []), {
+        id: uid(), category: newExpense.category, description: newExpense.description.trim(),
+        amount: Number(newExpense.amount) || 0, date: newExpense.date, receipt: null,
+      }],
+    });
+    setNewExpense({ category: "Labor", description: "", amount: "", date: todayStr() });
+  };
+  const removeExpense = async (id) => {
+    const exp = (job.expenses || []).find(e => e.id === id);
+    update({ expenses: job.expenses.filter(e => e.id !== id) });
+    if (exp?.receipt?.key) { try { await fetch("/api/upload/" + exp.receipt.key, { method: "DELETE" }); } catch (e) {} }
+  };
+  const attachReceipt = async (expenseId, file) => {
+    setUploadError(""); setUploadingExpenseReceipt(expenseId);
+    try {
+      const uploaded = await apiUpload(file);
+      update({ expenses: job.expenses.map(e => e.id === expenseId ? { ...e, receipt: uploaded } : e) });
+    } catch (e) {
+      setUploadError(e.message || "Couldn't upload that receipt.");
+    } finally {
+      setUploadingExpenseReceipt(false);
+    }
+  };
+  const addProjectFile = async (file) => {
+    setUploadError(""); setUploadingFile(true);
+    try {
+      const uploaded = await apiUpload(file);
+      update({ files: [...(job.files || []), { ...uploaded, id: uid(), uploadedAt: new Date().toISOString() }] });
+    } catch (e) {
+      setUploadError(e.message || "Couldn't upload that file.");
+    } finally {
+      setUploadingFile(false);
+    }
+  };
+  const removeProjectFile = async (id) => {
+    const f = (job.files || []).find(f => f.id === id);
+    update({ files: (job.files || []).filter(f => f.id !== id) });
+    if (f?.key) { try { await fetch("/api/upload/" + f.key, { method: "DELETE" }); } catch (e) {} }
+  };
+
+  // ---- Takeoff: plan sheets + measurements ----
+  const [uploadingSheet, setUploadingSheet] = useState(false);
+  const [activeSheetId, setActiveSheetId] = useState(null);
+  const sheetInputRef = useRef(null);
+  const takeoffSheets = job.takeoffSheets || [];
+  const takeoffMeasurements = job.takeoffMeasurements || [];
+  const activeSheet = takeoffSheets.find(s => s.id === activeSheetId);
+
+  const uploadSheet = async (file) => {
+    setUploadError(""); setUploadingSheet(true);
+    try {
+      const uploaded = await apiUpload(file);
+      update({ takeoffSheets: [...takeoffSheets, { ...uploaded, id: uid(), pixelsPerFoot: null }] });
+    } catch (e) {
+      setUploadError(e.message || "Couldn't upload that sheet.");
+    } finally {
+      setUploadingSheet(false);
+    }
+  };
+  const removeSheet = async (id) => {
+    const s = takeoffSheets.find(s => s.id === id);
+    update({ takeoffSheets: takeoffSheets.filter(s => s.id !== id), takeoffMeasurements: takeoffMeasurements.filter(m => m.sheetId !== id) });
+    if (s?.key) { try { await fetch("/api/upload/" + s.key, { method: "DELETE" }); } catch (e) {} }
+  };
+  const setSheetScale = (sheetId, pixelsPerFoot) => update({ takeoffSheets: takeoffSheets.map(s => s.id === sheetId ? { ...s, pixelsPerFoot } : s) });
+  const saveMeasurement = (m) => update({ takeoffMeasurements: [...takeoffMeasurements, m] });
+  const deleteMeasurement = (id) => update({ takeoffMeasurements: takeoffMeasurements.filter(m => m.id !== id) });
+
+  const quantitySummary = useMemo(() => {
+    const groups = {};
+    takeoffMeasurements.forEach(m => {
+      const key = m.label + "|" + m.unit;
+      groups[key] = groups[key] || { label: m.label, unit: m.unit, total: 0 };
+      groups[key].total += Number(m.value) || 0;
+    });
+    return Object.values(groups);
+  }, [takeoffMeasurements]);
+
+  const expenseTotals = useMemo(() => {
+    const list = job.expenses || [];
+    const byCat = { Labor: 0, Materials: 0, Other: 0 };
+    list.forEach(e => { byCat[e.category] = (byCat[e.category] || 0) + (Number(e.amount) || 0); });
+    const total = Object.values(byCat).reduce((s, v) => s + v, 0);
+    const revenue = Number(job.estimate?.amount) || 0;
+    const profit = revenue - total;
+    const margin = revenue > 0 ? Math.round((profit / revenue) * 100) : 0;
+    return { byCat, total, revenue, profit, margin };
+  }, [job.expenses, job.estimate]);
+
+  const tabs = [
+    { id: "details", label: "Details", icon: IFile },
+    { id: "pnl", label: "P&L", icon: IDollar },
+    { id: "takeoff", label: "Takeoff", icon: IRuler },
+    { id: "tasks", label: "Tasks", icon: IList },
+    { id: "schedule", label: "Schedule", icon: ICal },
+  ];
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(26,35,50,0.55)" }}>
+      <div className="bg-white rounded-sm w-full max-w-lg max-h-[88vh] overflow-hidden flex flex-col">
+        <div className="p-4 border-b flex items-start justify-between" style={{ borderColor: "#EEEDE6" }}>
+          <div className="flex-1 min-w-0">
+            <input value={job.name} onChange={(e) => update({ name: e.target.value })} style={{ fontFamily: "'Oswald', sans-serif" }} className="uppercase font-semibold text-lg w-full outline-none" />
+            <select value={job.status} onChange={(e) => update({ status: e.target.value })} className="text-xs px-1.5 py-0.5 border rounded-sm bg-white mt-1" style={{ borderColor: "#C9C5B8", color: STATUS_COLOR[job.status] }}>
+              {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <button onClick={onClose} className="ml-2 shrink-0"><IX size={20} /></button>
+        </div>
+        <div className="flex border-b" style={{ borderColor: "#EEEDE6" }}>
+          {tabs.map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} className="flex-1 flex items-center justify-center gap-1.5 py-2.5 text-xs font-semibold uppercase tracking-wide"
+              style={{ color: tab === t.id ? "#1A2332" : "#8A8577", borderBottom: tab === t.id ? "2px solid #E2600C" : "2px solid transparent" }}>
+              <t.icon size={13} /> {t.label}
+            </button>
+          ))}
+        </div>
+        <div className="p-4 overflow-y-auto flex-1">
+          {tab === "details" && (
+            <div className="space-y-3">
+              <div><label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Client</label>
+                <input value={job.client} onChange={(e) => update({ client: e.target.value })} className="w-full mt-1 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} /></div>
+              <div><label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Site address</label>
+                <input value={job.address} onChange={(e) => update({ address: e.target.value })} className="w-full mt-1 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} /></div>
+              <div><label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Crew / assigned to</label>
+                <input value={job.crew || ""} onChange={(e) => update({ crew: e.target.value })} placeholder="e.g. Dave, Marco" className="w-full mt-1 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} /></div>
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Start</label>
+                  <input type="date" value={job.startDate || ""} onChange={(e) => update({ startDate: e.target.value })} className="w-full mt-1 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} /></div>
+                <div><label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Due</label>
+                  <input type="date" value={job.dueDate || ""} onChange={(e) => update({ dueDate: e.target.value })} className="w-full mt-1 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} /></div>
+              </div>
+              <div className="pt-2">
+                <label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Progress</label>
+                <input type="range" min="0" max="100" value={job.progress || 0} onChange={(e) => update({ progress: Number(e.target.value) })} className="w-full mt-1" />
+                <Gauge value={job.progress || 0} color={STATUS_COLOR[job.status]} />
+              </div>
+              <div className="border-t pt-3" style={{ borderColor: "#EEEDE6" }}>
+                <label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Estimate</label>
+                <div className="grid grid-cols-2 gap-3 mt-1">
+                  <input type="number" value={job.estimate?.amount ?? 0} onChange={(e) => update({ estimate: { ...job.estimate, amount: Number(e.target.value) || 0 } })} className="px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+                  <select value={job.estimate?.status || "Draft"} onChange={(e) => update({ estimate: { ...job.estimate, status: e.target.value } })} className="px-2.5 py-2 border rounded-sm text-sm bg-white" style={{ borderColor: "#C9C5B8" }}>
+                    {["Draft", "Sent", "Approved", "Rejected"].map(s => <option key={s}>{s}</option>)}
+                  </select>
+                </div>
+              </div>
+              <div><label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Notes</label>
+                <textarea value={job.notes || ""} onChange={(e) => update({ notes: e.target.value })} rows={3} className="w-full mt-1 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} /></div>
+              <button onClick={() => { if (confirm("Delete this job? This can't be undone.")) onDelete(job.id); }} className="flex items-center gap-1.5 text-xs font-semibold mt-2" style={{ color: "#E2600C" }}>
+                <ITrash size={13} /> Delete job
+              </button>
+            </div>
+          )}
+          {tab === "pnl" && (
+            <div>
+              {uploadError && (
+                <div className="text-xs px-2.5 py-2 rounded-sm mb-3" style={{ background: "#FBEAE0", color: "#B4460A" }}>{uploadError}</div>
+              )}
+
+              <div className="grid grid-cols-2 gap-2.5 mb-4">
+                <div className="bg-white border rounded-sm p-2.5" style={{ borderColor: "#E4E1D6" }}>
+                  <div className="text-[10px] uppercase tracking-wide font-semibold" style={{ color: "#8A8577" }}>Revenue (estimate)</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="text-lg font-semibold">{fmtMoney(expenseTotals.revenue)}</div>
+                </div>
+                <div className="bg-white border rounded-sm p-2.5" style={{ borderColor: "#E4E1D6" }}>
+                  <div className="text-[10px] uppercase tracking-wide font-semibold" style={{ color: "#8A8577" }}>Total expenses</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="text-lg font-semibold">{fmtMoney(expenseTotals.total)}</div>
+                </div>
+                <div className="bg-white border rounded-sm p-2.5" style={{ borderColor: "#E4E1D6" }}>
+                  <div className="text-[10px] uppercase tracking-wide font-semibold" style={{ color: "#8A8577" }}>Net profit</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", color: expenseTotals.profit >= 0 ? "#4A7856" : "#E2600C" }} className="text-lg font-semibold">{fmtMoney(expenseTotals.profit)}</div>
+                </div>
+                <div className="bg-white border rounded-sm p-2.5" style={{ borderColor: "#E4E1D6" }}>
+                  <div className="text-[10px] uppercase tracking-wide font-semibold" style={{ color: "#8A8577" }}>Margin</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", color: expenseTotals.margin >= 0 ? "#4A7856" : "#E2600C" }} className="text-lg font-semibold">{expenseTotals.margin}%</div>
+                </div>
+              </div>
+
+              <div className="flex gap-3 mb-4 text-[11px]">
+                {EXPENSE_CATEGORIES.map(c => (
+                  <div key={c} className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full" style={{ background: EXPENSE_COLOR[c] }} />
+                    <span style={{ color: "#5B6470" }}>{c}: <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmtMoney(expenseTotals.byCat[c])}</span></span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="border-t pt-3 mb-4" style={{ borderColor: "#EEEDE6" }}>
+                <label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Add expense</label>
+                <div className="grid grid-cols-2 gap-2 mt-1.5">
+                  <select value={newExpense.category} onChange={(e) => setNewExpense(f => ({ ...f, category: e.target.value }))}
+                    className="px-2.5 py-2 border rounded-sm text-sm bg-white" style={{ borderColor: "#C9C5B8" }}>
+                    {EXPENSE_CATEGORIES.map(c => <option key={c}>{c}</option>)}
+                  </select>
+                  <input type="date" value={newExpense.date} onChange={(e) => setNewExpense(f => ({ ...f, date: e.target.value }))}
+                    className="px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+                  <input value={newExpense.description} onChange={(e) => setNewExpense(f => ({ ...f, description: e.target.value }))} placeholder="Description"
+                    className="col-span-2 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+                  <input type="number" value={newExpense.amount} onChange={(e) => setNewExpense(f => ({ ...f, amount: e.target.value }))} placeholder="Amount ($)"
+                    className="px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+                  <button onClick={addExpense} className="px-3 py-2 rounded-sm text-white text-xs font-semibold uppercase tracking-wide" style={{ background: "#2B5D8C" }}>Add</button>
+                </div>
+              </div>
+
+              {(!job.expenses || job.expenses.length === 0) ? (
+                <EmptyState icon={IDollar} title="No expenses logged" subtitle="Add labor and material costs above to track this job's margin." />
+              ) : (
+                <div className="space-y-1.5 mb-5">
+                  {job.expenses.slice().sort((a, b) => (b.date || "").localeCompare(a.date || "")).map(exp => (
+                    <div key={exp.id} className="flex items-center gap-2 px-2.5 py-2 border rounded-sm" style={{ borderColor: "#EEEDE6" }}>
+                      <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: EXPENSE_COLOR[exp.category] }} />
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm truncate">{exp.description}</div>
+                        <div className="text-[11px]" style={{ color: "#8A8577" }}>{exp.category} · {fmtDate(exp.date)}</div>
+                      </div>
+                      <div style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="text-sm shrink-0">{fmtMoney(exp.amount)}</div>
+                      {exp.receipt ? (
+                        <a href={exp.receipt.url} target="_blank" rel="noreferrer" className="shrink-0" title="View receipt">
+                          <ICamera size={14} color="#4A7856" />
+                        </a>
+                      ) : (
+                        <label className="shrink-0 cursor-pointer" title="Attach receipt photo">
+                          {uploadingExpenseReceipt === exp.id ? <span className="animate-spin inline-block"><ILoader size={14} color="#8A8577" /></span> : <ICamera size={14} color="#C9C5B8" />}
+                          <input type="file" accept="image/*" className="hidden" onChange={(e) => { if (e.target.files?.[0]) attachReceipt(exp.id, e.target.files[0]); e.target.value = ""; }} />
+                        </label>
+                      )}
+                      <button onClick={() => removeExpense(exp.id)}><IX size={14} color="#8A8577" /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="border-t pt-3" style={{ borderColor: "#EEEDE6" }}>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Project files & photos</label>
+                  <button onClick={() => projectFileInputRef.current?.click()} disabled={uploadingFile}
+                    className="flex items-center gap-1 text-[11px] font-semibold uppercase" style={{ color: "#2B5D8C" }}>
+                    {uploadingFile ? <span className="animate-spin"><ILoader size={12} /></span> : <IPaperclip size={12} />} Add file
+                  </button>
+                  <input type="file" ref={projectFileInputRef} className="hidden" onChange={(e) => { if (e.target.files?.[0]) addProjectFile(e.target.files[0]); e.target.value = ""; }} />
+                </div>
+                {(!job.files || job.files.length === 0) ? (
+                  <EmptyState icon={IPaperclip} title="No files yet" subtitle="Add plan sheets, takeoffs, or job-site photos." />
+                ) : (
+                  <div className="grid grid-cols-3 gap-2">
+                    {job.files.map(f => (
+                      <div key={f.id} className="relative border rounded-sm overflow-hidden group" style={{ borderColor: "#E4E1D6" }}>
+                        {f.type?.startsWith("image/") ? (
+                          <a href={f.url} target="_blank" rel="noreferrer"><img src={f.url} alt={f.name} className="w-full h-20 object-cover" /></a>
+                        ) : (
+                          <a href={f.url} target="_blank" rel="noreferrer" className="flex flex-col items-center justify-center h-20 text-center px-1" style={{ color: "#5B6470" }}>
+                            <IFile size={18} /><span className="text-[9px] truncate w-full mt-1">{f.name}</span>
+                          </a>
+                        )}
+                        <button onClick={() => removeProjectFile(f.id)} className="absolute top-0.5 right-0.5 bg-white/90 rounded-sm p-0.5"><IX size={11} color="#8A8577" /></button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          {tab === "takeoff" && (
+            <div>
+              {uploadError && (
+                <div className="text-xs px-2.5 py-2 rounded-sm mb-3" style={{ background: "#FBEAE0", color: "#B4460A" }}>{uploadError}</div>
+              )}
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Plan sheets</label>
+                <button onClick={() => sheetInputRef.current?.click()} disabled={uploadingSheet}
+                  className="flex items-center gap-1 text-[11px] font-semibold uppercase" style={{ color: "#2B5D8C" }}>
+                  {uploadingSheet ? <span className="animate-spin"><ILoader size={12} /></span> : <IPlus size={12} />} Add sheet
+                </button>
+                <input type="file" accept="image/*,application/pdf" ref={sheetInputRef} className="hidden"
+                  onChange={(e) => { if (e.target.files?.[0]) uploadSheet(e.target.files[0]); e.target.value = ""; }} />
+              </div>
+
+              {takeoffSheets.length === 0 ? (
+                <EmptyState icon={IRuler} title="No plan sheets yet" subtitle="Upload a PDF or image of a plan sheet to start measuring quantities." />
+              ) : (
+                <div className="space-y-1.5 mb-4">
+                  {takeoffSheets.map(s => (
+                    <div key={s.id} className="flex items-center gap-2 px-2.5 py-2 border rounded-sm" style={{ borderColor: "#EEEDE6" }}>
+                      <IFile size={14} color="#8A8577" />
+                      <span className="flex-1 text-sm truncate">{s.name}</span>
+                      <span className="text-[10px] uppercase px-1.5 py-0.5 rounded-sm shrink-0" style={{ background: s.pixelsPerFoot ? "#E8F3EC" : "#FBEAE0", color: s.pixelsPerFoot ? "#4A7856" : "#B4460A" }}>
+                        {s.pixelsPerFoot ? "Calibrated" : "Not calibrated"}
+                      </span>
+                      <button onClick={() => setActiveSheetId(s.id)} className="text-[11px] font-semibold uppercase shrink-0" style={{ color: "#2B5D8C" }}>Open</button>
+                      <button onClick={() => removeSheet(s.id)}><IX size={14} color="#8A8577" /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="border-t pt-3" style={{ borderColor: "#EEEDE6" }}>
+                <label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Quantities</label>
+                {quantitySummary.length === 0 ? (
+                  <div className="text-xs mt-2" style={{ color: "#8A8577" }}>Measurements you take on a sheet will summarize here.</div>
+                ) : (
+                  <div className="mt-2 space-y-1">
+                    {quantitySummary.map(q => (
+                      <div key={q.label + q.unit} className="flex items-center justify-between text-sm px-2.5 py-1.5 border-b" style={{ borderColor: "#EEEDE6" }}>
+                        <span>{q.label}</span>
+                        <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{q.total.toLocaleString()} {q.unit}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {takeoffMeasurements.length > 0 && (
+                  <details className="mt-3">
+                    <summary className="text-[11px] cursor-pointer" style={{ color: "#8A8577" }}>Show individual measurements ({takeoffMeasurements.length})</summary>
+                    <div className="mt-2 space-y-1">
+                      {takeoffMeasurements.map(m => (
+                        <div key={m.id} className="flex items-center gap-2 text-[11px] px-2 py-1">
+                          <span className="flex-1 truncate">{m.label} <span style={{ color: "#8A8577" }}>· {m.sheetName}</span></span>
+                          <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{m.value} {m.unit}</span>
+                          <button onClick={() => deleteMeasurement(m.id)}><IX size={12} color="#8A8577" /></button>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+              </div>
+            </div>
+          )}
+          {tab === "tasks" && (
+            <div>
+              <div className="flex gap-2 mb-3">
+                <input value={newTask} onChange={(e) => setNewTask(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addTask()} placeholder="Add a task…" className="flex-1 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+                <input value={newTaskAssignee} onChange={(e) => setNewTaskAssignee(e.target.value)} placeholder="Who" className="w-20 px-2 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+                <button onClick={addTask} className="px-3 rounded-sm text-white" style={{ background: "#2B5D8C" }}><IPlus size={16} /></button>
+              </div>
+              {(!job.tasks || job.tasks.length === 0) ? (
+                <EmptyState icon={IList} title="No tasks yet" subtitle="Add the first punch-list item above." />
+              ) : (
+                <div className="space-y-1.5">
+                  {job.tasks.map(t => (
+                    <div key={t.id} className="flex items-center gap-2 px-2.5 py-2 border rounded-sm" style={{ borderColor: "#EEEDE6" }}>
+                      <button onClick={() => toggleTask(t.id)} className="w-4 h-4 shrink-0 rounded-sm border flex items-center justify-center" style={{ borderColor: t.done ? "#4A7856" : "#C9C5B8", background: t.done ? "#4A7856" : "white" }}>
+                        {t.done && <ICheck size={11} color="white" />}
+                      </button>
+                      <span className={"flex-1 text-sm " + (t.done ? "line-through" : "")} style={{ color: t.done ? "#8A8577" : "#1A2332" }}>{t.text}</span>
+                      {t.assignee && <span className="text-[11px]" style={{ color: "#8A8577" }}>{t.assignee}</span>}
+                      <button onClick={() => removeTask(t.id)}><IX size={14} color="#8A8577" /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {tab === "schedule" && (
+            <div>
+              <div className="grid grid-cols-2 gap-2 mb-2">
+                <input value={newAppt.title} onChange={(e) => setNewAppt(a => ({ ...a, title: e.target.value }))} placeholder="Appointment title" className="col-span-2 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+                <input type="date" value={newAppt.date} onChange={(e) => setNewAppt(a => ({ ...a, date: e.target.value }))} className="px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+                <input type="time" value={newAppt.time} onChange={(e) => setNewAppt(a => ({ ...a, time: e.target.value }))} className="px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+                <select value={newAppt.type} onChange={(e) => setNewAppt(a => ({ ...a, type: e.target.value }))} className="col-span-2 px-2.5 py-2 border rounded-sm text-sm bg-white" style={{ borderColor: "#C9C5B8" }}>
+                  {APPT_TYPES.map(t => <option key={t}>{t}</option>)}
+                </select>
+              </div>
+              <button onClick={addAppt} className="w-full py-2 rounded-sm text-white text-xs font-semibold uppercase tracking-wide mb-3" style={{ background: "#2B5D8C" }}>Add appointment</button>
+              {(!job.appointments || job.appointments.length === 0) ? (
+                <EmptyState icon={ICal} title="Nothing scheduled" subtitle="Add a site visit, inspection, or install date." />
+              ) : (
+                <div className="space-y-1.5">
+                  {job.appointments.slice().sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time)).map(a => (
+                    <div key={a.id} className="flex items-center gap-2 px-2.5 py-2 border rounded-sm" style={{ borderColor: "#EEEDE6" }}>
+                      <div style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] w-16 shrink-0">{fmtDate(a.date)} {a.time}</div>
+                      <span className="flex-1 text-sm">{a.title}</span>
+                      <span className="text-[10px] uppercase px-1.5 py-0.5 rounded-sm" style={{ background: "#EEEDE6", color: "#5B6470" }}>{a.type}</span>
+                      <button onClick={() => removeAppt(a.id)}><IX size={14} color="#8A8577" /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {activeSheet && (
+        <TakeoffCanvas
+          sheet={activeSheet}
+          measurements={takeoffMeasurements.filter(m => m.sheetId === activeSheet.id)}
+          onClose={() => setActiveSheetId(null)}
+          onSetScale={(px) => setSheetScale(activeSheet.id, px)}
+          onSaveMeasurement={saveMeasurement}
+          onDeleteMeasurement={deleteMeasurement}
+        />
+      )}
+    </div>
+  );
+}
+
+function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasurement, onDeleteMeasurement }) {
+  const [imgError, setImgError] = useState("");
+  const [imgReady, setImgReady] = useState(false);
+  const [naturalW, setNaturalW] = useState(0);
+  const [naturalH, setNaturalH] = useState(0);
+  const [zoom, setZoom] = useState(1);
+  const [mode, setMode] = useState(null); // null | calibrate | line | area | count
+  const [points, setPoints] = useState([]);
+  const [pendingCalibration, setPendingCalibration] = useState(null); // { points, distancePx }
+  const [calibrationFeet, setCalibrationFeet] = useState("");
+  const [labelForm, setLabelForm] = useState(null); // { type, valuePx, points }
+  const [labelText, setLabelText] = useState("");
+
+  const canvasRef = useRef(null);
+  const containerRef = useRef(null);
+  const imgElRef = useRef(null);
+
+  // Load the sheet — render PDFs to an image first, use uploaded images directly.
+  useEffect(() => {
+    let cancelled = false;
+    setImgReady(false); setImgError("");
+    (async () => {
+      try {
+        const isPdf = (sheet.type || "").includes("pdf") || (sheet.name || "").toLowerCase().endsWith(".pdf");
+        const src = isPdf ? await renderPdfFirstPageToDataUrl(sheet.url) : sheet.url;
+        const img = new Image();
+        img.onload = () => {
+          if (cancelled) return;
+          imgElRef.current = img;
+          setNaturalW(img.naturalWidth); setNaturalH(img.naturalHeight);
+          const containerWidth = containerRef.current?.clientWidth || 800;
+          setZoom(Math.min(1, (containerWidth - 32) / img.naturalWidth));
+          setImgReady(true);
+        };
+        img.onerror = () => { if (!cancelled) setImgError("Couldn't load the image for this sheet."); };
+        img.src = src;
+      } catch (e) {
+        if (!cancelled) setImgError(e.message || "Couldn't load this sheet.");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [sheet.id, sheet.url]);
+
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current, img = imgElRef.current;
+    if (!canvas || !img || !naturalW) return;
+    canvas.width = naturalW * zoom; canvas.height = naturalH * zoom;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.save(); ctx.scale(zoom, zoom);
+    ctx.drawImage(img, 0, 0, naturalW, naturalH);
+
+    const drawShape = (pts, type, color, label) => {
+      if (!pts.length) return;
+      ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2 / zoom;
+      if (type === "count") {
+        pts.forEach((p, i) => {
+          ctx.beginPath(); ctx.arc(p.x, p.y, 7 / zoom, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = "white"; ctx.font = (10 / zoom) + "px sans-serif"; ctx.textAlign = "center";
+          ctx.fillText(String(i + 1), p.x, p.y + 3 / zoom);
+          ctx.fillStyle = color;
+        });
+      } else {
+        ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+        if (type === "area" && pts.length > 2) { ctx.closePath(); ctx.globalAlpha = 0.15; ctx.fill(); ctx.globalAlpha = 1; }
+        ctx.stroke();
+        pts.forEach(p => { ctx.beginPath(); ctx.arc(p.x, p.y, 4 / zoom, 0, Math.PI * 2); ctx.fill(); });
+      }
+      if (label) {
+        const mid = pts[Math.floor((pts.length - 1) / 2)];
+        ctx.font = (13 / zoom) + "px sans-serif"; ctx.fillStyle = "#1A2332"; ctx.textAlign = "left";
+        ctx.fillText(label, mid.x + 8 / zoom, mid.y - 8 / zoom);
+      }
+    };
+
+    measurements.forEach(m => drawShape(m.points, m.type, "#2B5D8C", `${m.label} (${m.value} ${m.unit})`));
+    if (points.length) drawShape(points, mode === "calibrate" ? "line" : mode, "#E2600C", null);
+    if (pendingCalibration) drawShape(pendingCalibration.points, "line", "#E2600C", null);
+    ctx.restore();
+  }, [naturalW, naturalH, zoom, points, mode, measurements, pendingCalibration]);
+
+  useEffect(() => { if (imgReady) draw(); }, [imgReady, draw]);
+
+  const handleClick = (e) => {
+    if (!mode || labelForm || pendingCalibration) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / zoom, y = (e.clientY - rect.top) / zoom;
+    if (mode === "calibrate") {
+      const next = [...points, { x, y }];
+      if (next.length === 2) { setPendingCalibration({ points: next, distancePx: polylineLength(next) }); setPoints([]); }
+      else setPoints(next);
+      return;
+    }
+    setPoints(p => [...p, { x, y }]);
+  };
+
+  const minPoints = mode === "area" ? 3 : mode === "count" ? 1 : 2;
+  const canFinish = mode && mode !== "calibrate" && points.length >= minPoints;
+
+  const handleFinish = () => {
+    if (mode !== "count" && !sheet.pixelsPerFoot) { alert("Calibrate this sheet's scale first (use the Calibrate tool)."); return; }
+    const valuePx = mode === "area" ? polygonArea(points) : mode === "line" ? polylineLength(points) : points.length;
+    setLabelForm({ type: mode, valuePx, points });
+    setLabelText("");
+  };
+  const handleCancel = () => { setPoints([]); setMode(null); };
+
+  const confirmLabel = () => {
+    if (!labelText.trim()) return;
+    let value, unit;
+    if (labelForm.type === "line") { value = Math.round((labelForm.valuePx / sheet.pixelsPerFoot) * 10) / 10; unit = "ft"; }
+    else if (labelForm.type === "area") { value = Math.round((labelForm.valuePx / (sheet.pixelsPerFoot ** 2)) * 10) / 10; unit = "sq ft"; }
+    else { value = labelForm.valuePx; unit = "count"; }
+    onSaveMeasurement({ id: uid(), sheetId: sheet.id, sheetName: sheet.name, type: labelForm.type, label: labelText.trim(), value, unit, points: labelForm.points });
+    setLabelForm(null); setPoints([]); setMode(null);
+  };
+
+  const confirmCalibration = () => {
+    const feet = Number(calibrationFeet);
+    if (!feet || feet <= 0) return;
+    onSetScale(pendingCalibration.distancePx / feet);
+    setPendingCalibration(null); setCalibrationFeet(""); setMode(null);
+  };
+
+  const toolBtn = (m, label, Ic) => (
+    <button onClick={() => { setMode(m); setPoints([]); }}
+      className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold uppercase tracking-wide rounded-sm"
+      style={{ background: mode === m ? "#1A2332" : "#EEEDE6", color: mode === m ? "white" : "#5B6470" }}>
+      <Ic size={13} /> {label}
+    </button>
+  );
+
+  return (
+    <div className="fixed inset-0 z-[60] flex flex-col" style={{ background: "#1A2332" }}>
+      <div className="flex items-center justify-between px-4 py-2.5 shrink-0">
+        <div className="text-white text-sm font-semibold truncate pr-3">{sheet.name}</div>
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="text-[11px]" style={{ color: sheet.pixelsPerFoot ? "#8BD1A8" : "#E8B23D" }}>
+            {sheet.pixelsPerFoot ? "Scale set" : "Not calibrated"}
+          </span>
+          <button onClick={onClose} className="text-white p-1"><IX size={20} /></button>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 px-4 pb-2.5 shrink-0">
+        {toolBtn("calibrate", "Calibrate", IRuler)}
+        {toolBtn("line", "Line", IRuler)}
+        {toolBtn("area", "Area", IGrid)}
+        {toolBtn("count", "Count", IList)}
+        <div className="flex items-center gap-1 ml-1">
+          <button onClick={() => setZoom(z => Math.max(0.1, z - 0.15))} className="px-2 py-1 rounded-sm text-white text-xs" style={{ background: "#2B5D8C" }}>−</button>
+          <span className="text-[11px] text-white w-10 text-center">{Math.round(zoom * 100)}%</span>
+          <button onClick={() => setZoom(z => Math.min(4, z + 0.15))} className="px-2 py-1 rounded-sm text-white text-xs" style={{ background: "#2B5D8C" }}>+</button>
+        </div>
+        {canFinish && <button onClick={handleFinish} className="px-3 py-1.5 rounded-sm text-white text-xs font-semibold uppercase" style={{ background: "#4A7856" }}>Finish</button>}
+        {mode && <button onClick={handleCancel} className="px-3 py-1.5 rounded-sm text-xs font-semibold uppercase" style={{ background: "#EEEDE6", color: "#5B6470" }}>Cancel</button>}
+        {mode && <span className="text-[11px]" style={{ color: "#8B96A5" }}>
+          {mode === "calibrate" ? "Click 2 points spanning a known distance" : `Click to place points${mode !== "count" ? ", then Finish" : " (each click = 1 item), then Finish"}`}
+        </span>}
+      </div>
+
+      <div ref={containerRef} className="flex-1 overflow-auto p-4">
+        {imgError && <div className="text-white text-sm">{imgError}</div>}
+        {!imgReady && !imgError && <div className="text-white text-sm flex items-center gap-2"><span className="animate-spin"><ILoader size={16} /></span> Loading sheet…</div>}
+        {imgReady && <canvas ref={canvasRef} onClick={handleClick} style={{ cursor: mode ? "crosshair" : "default", display: "block" }} />}
+      </div>
+
+      {pendingCalibration && (
+        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-white rounded-sm p-3 shadow-lg flex items-center gap-2">
+          <span className="text-xs" style={{ color: "#5B6470" }}>That line represents how many feet?</span>
+          <input autoFocus type="number" value={calibrationFeet} onChange={(e) => setCalibrationFeet(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && confirmCalibration()}
+            className="w-20 px-2 py-1 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+          <button onClick={confirmCalibration} className="px-2.5 py-1 rounded-sm text-white text-xs font-semibold" style={{ background: "#2B5D8C" }}>Set scale</button>
+          <button onClick={() => { setPendingCalibration(null); setCalibrationFeet(""); }}><IX size={14} color="#8A8577" /></button>
+        </div>
+      )}
+      {labelForm && (
+        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-white rounded-sm p-3 shadow-lg flex items-center gap-2">
+          <span className="text-xs" style={{ color: "#5B6470" }}>Label this {labelForm.type}:</span>
+          <input autoFocus value={labelText} onChange={(e) => setLabelText(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && confirmLabel()} placeholder="e.g. Curb, Concrete pad, Trees"
+            className="w-44 px-2 py-1 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+          <button onClick={confirmLabel} className="px-2.5 py-1 rounded-sm text-white text-xs font-semibold" style={{ background: "#4A7856" }}>Save</button>
+          <button onClick={() => { setLabelForm(null); setPoints([]); setMode(null); }}><IX size={14} color="#8A8577" /></button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function KPI({ label, value, icon: Ic, color }) {
+  return (
+    <div className="bg-white border rounded-sm p-3" style={{ borderColor: "#E4E1D6" }}>
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-[10px] uppercase tracking-wide font-semibold" style={{ color: "#8A8577" }}>{label}</span>
+        <Ic size={13} color={color} />
+      </div>
+      <div style={{ fontFamily: "'IBM Plex Mono', monospace", color: "#1A2332" }} className="text-xl font-semibold">{value}</div>
+    </div>
+  );
+}
+
+function SyncPill({ status }) {
+  const config = {
+    saved: { icon: ITrend, label: "Saved", color: "#4A7856" },
+    saving: { icon: ILoader, label: "Saving…", color: "#8B96A5" },
+    retrying: { icon: IAlert, label: "Reconnecting…", color: "#D9A02E" },
+    stuck: { icon: IAlert, label: "Not saved yet", color: "#E2600C" },
+  }[status] || { icon: ITrend, label: "Saved", color: "#4A7856" };
+  const Ic = config.icon;
+  const spinning = status === "saving" || status === "retrying";
+  return (
+    <div className="flex items-center gap-1.5 text-[11px]" style={{ color: config.color }} title="Changes save to the server automatically, with retries if the connection drops.">
+      <span className={spinning ? "animate-spin" : ""}><Ic size={12} /></span>
+      <span className="hidden sm:inline">{config.label}</span>
+    </div>
+  );
+}
+
+function OpsCenterInner() {
+  const [jobs, setJobs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadStatus, setLoadStatus] = useState("loading"); // loading | ok | error
+  const [syncStatus, setSyncStatus] = useState("saved");
+  const [tab, setTab] = useState("board");
+  const [selectedId, setSelectedId] = useState(null);
+  const [showNew, setShowNew] = useState(false);
+  const [taskFilter, setTaskFilter] = useState("open");
+  const pendingRef = useRef(null);
+  const retryTimerRef = useRef(null);
+  const attemptRef = useRef(0);
+  const fileInputRef = useRef(null);
+
+  const runLoad = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await apiLoad();
+      setJobs(data);
+      setLoadStatus("ok");
+    } catch (e) {
+      setLoadStatus("error");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    runLoad();
+    return () => { if (retryTimerRef.current) clearTimeout(retryTimerRef.current); };
+  }, [runLoad]);
+
+  const attemptSave = useCallback(async (data) => {
+    pendingRef.current = data;
+    setSyncStatus(attemptRef.current > 0 ? "retrying" : "saving");
+    try {
+      await apiSave(data);
+      if (pendingRef.current !== data) return;
+      attemptRef.current = 0;
+      if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
+      setSyncStatus("saved");
+    } catch (e) {
+      if (pendingRef.current !== data) return;
+      const step = Math.min(attemptRef.current, RETRY_SCHEDULE.length - 1);
+      const delay = RETRY_SCHEDULE[step];
+      attemptRef.current += 1;
+      setSyncStatus(attemptRef.current >= 3 ? "stuck" : "retrying");
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = setTimeout(() => attemptSave(pendingRef.current), delay);
+    }
+  }, []);
+
+  useEffect(() => {
+    const onOnline = () => { if (pendingRef.current) attemptSave(pendingRef.current); };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  }, [attemptSave]);
+
+  const persist = useCallback((next) => {
+    if (loadStatus === "error") return false;
+    setJobs(next);
+    attemptSave(next);
+    return true;
+  }, [attemptSave, loadStatus]);
+
+  const addJob = (job) => { if (persist([job, ...jobs])) setShowNew(false); };
+  const updateJob = (job) => persist(jobs.map(j => j.id === job.id ? job : j));
+  const deleteJob = (id) => { if (persist(jobs.filter(j => j.id !== id))) setSelectedId(null); };
+
+  const handleExport = () => {
+    const blob = new Blob([JSON.stringify(jobs, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `ops-center-backup-${todayStr()}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
+  const handleImportFile = (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        if (!Array.isArray(parsed)) throw new Error("bad format");
+        if (jobs.length > 0 && !confirm(`Replace the ${jobs.length} job(s) here with ${parsed.length} from the file?`)) return;
+        persist(parsed);
+      } catch (err) {
+        alert("Couldn't read that file — make sure it's a backup exported from this app.");
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const selectedJob = jobs.find(j => j.id === selectedId);
+
+  const kpis = useMemo(() => {
+    const active = jobs.filter(j => j.status !== "Complete");
+    const pendingEstimateValue = jobs.filter(j => ["Draft", "Sent"].includes(j.estimate?.status)).reduce((s, j) => s + (Number(j.estimate?.amount) || 0), 0);
+    const weekFromNow = new Date(); weekFromNow.setDate(weekFromNow.getDate() + 7);
+    const weekApptCount = jobs.reduce((s, j) => s + (j.appointments || []).filter(a => a.date >= todayStr() && a.date <= weekFromNow.toISOString().slice(0, 10)).length, 0);
+    const avgProgress = active.length ? Math.round(active.reduce((s, j) => s + (j.progress || 0), 0) / active.length) : 0;
+    return { activeCount: active.length, pendingEstimateValue, weekApptCount, avgProgress };
+  }, [jobs]);
+
+  const portfolioPnl = useMemo(() => {
+    let revenue = 0, expenses = 0;
+    jobs.forEach(j => {
+      revenue += Number(j.estimate?.amount) || 0;
+      (j.expenses || []).forEach(e => { expenses += Number(e.amount) || 0; });
+    });
+    const profit = revenue - expenses;
+    const margin = revenue > 0 ? Math.round((profit / revenue) * 100) : 0;
+    return { revenue, expenses, profit, margin };
+  }, [jobs]);
+
+  const upcomingAppts = useMemo(() => {
+    const list = [];
+    jobs.forEach(j => (j.appointments || []).forEach(a => { if (a.date >= todayStr()) list.push({ ...a, jobName: j.name, jobId: j.id }); }));
+    return list.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time)).slice(0, 6);
+  }, [jobs]);
+
+  const allTasks = useMemo(() => {
+    const list = [];
+    jobs.forEach(j => (j.tasks || []).forEach(t => list.push({ ...t, jobName: j.name, jobId: j.id })));
+    return list;
+  }, [jobs]);
+  const filteredTasks = allTasks.filter(t => taskFilter === "all" ? true : taskFilter === "open" ? !t.done : t.done);
+  const attentionJobs = useMemo(() => jobs.filter(j => j.status !== "Complete" && j.dueDate && j.dueDate < todayStr()), [jobs]);
+
+  if (loading) {
+    return <div className="min-h-screen flex items-center justify-center" style={{ background: "#EEEDE6" }}><span className="animate-spin"><ILoader color="#2B5D8C" /></span></div>;
+  }
+
+  return (
+    <div className="min-h-screen" style={{ background: "#EEEDE6", fontFamily: "'Inter', sans-serif" }}>
+      <div style={{ background: "#1A2332" }} className="px-4 py-3.5 sticky top-0 z-40">
+        <div className="flex items-center justify-between max-w-5xl mx-auto">
+          <div>
+            <div style={{ fontFamily: "'Oswald', sans-serif", letterSpacing: "0.06em" }} className="text-white uppercase font-semibold text-lg leading-none">Ops Center</div>
+            <div className="text-[11px] mt-0.5" style={{ color: "#8B96A5" }}>Jobs · estimates · schedule</div>
+          </div>
+          <div className="flex items-center gap-3">
+            <SyncPill status={syncStatus} />
+            <button onClick={handleExport} title="Download a backup of all job data" className="p-2 rounded-sm hover:bg-white/10" style={{ color: "#8B96A5" }}><IDownload size={15} /></button>
+            <button onClick={() => fileInputRef.current?.click()} title="Restore job data from a backup file" className="p-2 rounded-sm hover:bg-white/10" style={{ color: "#8B96A5" }}><IUpload size={15} /></button>
+            <input type="file" accept="application/json" ref={fileInputRef} onChange={handleImportFile} className="hidden" />
+            <button onClick={() => setShowNew(true)} disabled={loadStatus === "error"}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-sm text-white text-xs font-semibold uppercase tracking-wide disabled:opacity-40" style={{ background: "#E2600C" }}>
+              <IPlus size={14} /> New job
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="max-w-5xl mx-auto px-4 py-4">
+        {loadStatus === "error" && (
+          <div className="flex items-center justify-between gap-2 text-xs px-3 py-2 rounded-sm mb-3" style={{ background: "#FBEAE0", color: "#B4460A" }}>
+            <span className="flex items-center gap-2"><IAlert size={14} /> Couldn't reach the server — your data is safe in the database, this just couldn't load it right now.</span>
+            <button onClick={runLoad} className="font-semibold uppercase tracking-wide shrink-0">Retry</button>
+          </div>
+        )}
+        {syncStatus === "stuck" && (
+          <div className="flex items-center gap-2 text-xs px-3 py-2 rounded-sm mb-3" style={{ background: "#FBEAE0", color: "#B4460A" }}>
+            <IAlert size={14} /> Still trying to save your last change — keep this tab open.
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 mb-3">
+          <KPI label="Active jobs" value={kpis.activeCount} icon={ITrend} color="#2B5D8C" />
+          <KPI label="Pending estimates" value={fmtMoney(kpis.pendingEstimateValue)} icon={IDollar} color="#D9A02E" />
+          <KPI label="This week" value={kpis.weekApptCount} icon={ICal} color="#4A7856" />
+          <KPI label="Avg. progress" value={kpis.avgProgress + "%"} icon={IList} color="#E2600C" />
+        </div>
+
+        {jobs.length > 0 && (
+          <div className="bg-white border rounded-sm p-3 mb-5 flex flex-wrap items-center gap-x-6 gap-y-2" style={{ borderColor: "#E4E1D6" }}>
+            <span className="text-[10px] uppercase tracking-wide font-semibold" style={{ color: "#8A8577" }}>Portfolio P&amp;L</span>
+            <span className="text-xs" style={{ color: "#5B6470" }}>Revenue <b style={{ fontFamily: "'IBM Plex Mono', monospace", color: "#1A2332" }}>{fmtMoney(portfolioPnl.revenue)}</b></span>
+            <span className="text-xs" style={{ color: "#5B6470" }}>Expenses <b style={{ fontFamily: "'IBM Plex Mono', monospace", color: "#1A2332" }}>{fmtMoney(portfolioPnl.expenses)}</b></span>
+            <span className="text-xs" style={{ color: "#5B6470" }}>Profit <b style={{ fontFamily: "'IBM Plex Mono', monospace", color: portfolioPnl.profit >= 0 ? "#4A7856" : "#E2600C" }}>{fmtMoney(portfolioPnl.profit)}</b></span>
+            <span className="text-xs" style={{ color: "#5B6470" }}>Margin <b style={{ fontFamily: "'IBM Plex Mono', monospace", color: portfolioPnl.margin >= 0 ? "#4A7856" : "#E2600C" }}>{portfolioPnl.margin}%</b></span>
+          </div>
+        )}
+
+        {attentionJobs.length > 0 && (
+          <div className="flex items-start gap-2 text-xs px-3 py-2.5 rounded-sm mb-5" style={{ background: "#FBEAE0", color: "#8A3C0E" }}>
+            <IAlert size={14} className="mt-0.5 shrink-0" />
+            <span><strong>{attentionJobs.length}</strong> job{attentionJobs.length > 1 ? "s" : ""} past due: {attentionJobs.map(j => j.name).join(", ")}</span>
+          </div>
+        )}
+
+        <div className="flex gap-1 mb-4 border-b" style={{ borderColor: "#D7D3C5" }}>
+          {[{ id: "board", label: "Job board", icon: IGrid }, { id: "schedule", label: "Schedule", icon: ICal }, { id: "tasks", label: "Tasks", icon: IList }].map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} className="flex items-center gap-1.5 px-3 py-2 text-xs font-semibold uppercase tracking-wide"
+              style={{ color: tab === t.id ? "#1A2332" : "#8A8577", borderBottom: tab === t.id ? "2px solid #E2600C" : "2px solid transparent" }}>
+              <t.icon size={13} /> {t.label}
+            </button>
+          ))}
+        </div>
+
+        {tab === "board" && (
+          jobs.length === 0 && loadStatus === "error" ? (
+            <EmptyState icon={IAlert} title="Couldn't load your jobs" subtitle="Connection hiccup, not an empty board — your data should still be in the database." actionLabel="Retry" onAction={runLoad} />
+          ) : jobs.length === 0 ? (
+            <EmptyState icon={IGrid} title="No jobs yet" subtitle="Create your first job to start tracking estimates and progress." actionLabel="New job" onAction={() => setShowNew(true)} />
+          ) : (
+            <div className="flex gap-3 overflow-x-auto pb-2">
+              {STATUSES.map(status => {
+                const colJobs = jobs.filter(j => j.status === status);
+                return (
+                  <div key={status} className="min-w-[250px] w-[250px] shrink-0">
+                    <div className="flex items-center gap-1.5 mb-2 px-0.5">
+                      <span className="w-2 h-2 rounded-full" style={{ background: STATUS_COLOR[status] }} />
+                      <span style={{ fontFamily: "'Oswald', sans-serif" }} className="uppercase text-xs font-semibold tracking-wide">{status}</span>
+                      <span className="text-[11px]" style={{ color: "#8A8577" }}>({colJobs.length})</span>
+                    </div>
+                    {colJobs.length === 0 ? (
+                      <div className="border-2 border-dashed rounded-sm p-4 text-center text-[11px]" style={{ borderColor: "#D7D3C5", color: "#8A8577" }}>Empty</div>
+                    ) : colJobs.map(job => <JobCard key={job.id} job={job} onOpen={setSelectedId} />)}
+                  </div>
+                );
+              })}
+            </div>
+          )
+        )}
+
+        {tab === "schedule" && (
+          upcomingAppts.length === 0 ? (
+            <EmptyState icon={ICal} title="Nothing on the calendar" subtitle="Open a job and add a site visit, inspection, or install date." />
+          ) : (
+            <div className="bg-white rounded-sm border" style={{ borderColor: "#E4E1D6" }}>
+              {upcomingAppts.map((a, i) => (
+                <button key={a.id} onClick={() => setSelectedId(a.jobId)} className="w-full flex items-center gap-3 px-3.5 py-3 text-left" style={{ borderBottom: i < upcomingAppts.length - 1 ? "1px solid #EEEDE6" : "none" }}>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="text-xs w-20 shrink-0"><div className="font-semibold">{fmtDate(a.date)}</div><div style={{ color: "#8A8577" }}>{a.time}</div></div>
+                  <div className="flex-1 min-w-0"><div className="text-sm font-medium truncate">{a.title}</div><div className="text-[11px]" style={{ color: "#8A8577" }}>{a.jobName}</div></div>
+                  <span className="text-[10px] uppercase px-1.5 py-0.5 rounded-sm shrink-0" style={{ background: "#EEEDE6", color: "#5B6470" }}>{a.type}</span>
+                  <IChevron size={14} color="#C9C5B8" />
+                </button>
+              ))}
+            </div>
+          )
+        )}
+
+        {tab === "tasks" && (
+          <div>
+            <div className="flex gap-1.5 mb-3">
+              {["open", "done", "all"].map(f => (
+                <button key={f} onClick={() => setTaskFilter(f)} className="px-2.5 py-1 text-[11px] uppercase font-semibold tracking-wide rounded-sm border"
+                  style={{ borderColor: taskFilter === f ? "#1A2332" : "#D7D3C5", background: taskFilter === f ? "#1A2332" : "white", color: taskFilter === f ? "white" : "#5B6470" }}>
+                  {f}
+                </button>
+              ))}
+            </div>
+            {filteredTasks.length === 0 ? (
+              <EmptyState icon={IList} title="Nothing here" subtitle="Tasks you add inside a job will show up in this list." />
+            ) : (
+              <div className="bg-white rounded-sm border" style={{ borderColor: "#E4E1D6" }}>
+                {filteredTasks.map((t, i) => (
+                  <button key={t.id} onClick={() => setSelectedId(t.jobId)} className="w-full flex items-center gap-3 px-3.5 py-2.5 text-left" style={{ borderBottom: i < filteredTasks.length - 1 ? "1px solid #EEEDE6" : "none" }}>
+                    <div className="w-4 h-4 shrink-0 rounded-sm border flex items-center justify-center" style={{ borderColor: t.done ? "#4A7856" : "#C9C5B8", background: t.done ? "#4A7856" : "white" }}>{t.done && <ICheck size={11} color="white" />}</div>
+                    <span className={"flex-1 text-sm truncate " + (t.done ? "line-through" : "")} style={{ color: t.done ? "#8A8577" : "#1A2332" }}>{t.text}</span>
+                    <span className="text-[11px] shrink-0" style={{ color: "#8A8577" }}>{t.jobName}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {selectedJob && <JobModal job={selectedJob} onClose={() => setSelectedId(null)} onUpdate={updateJob} onDelete={deleteJob} />}
+      {showNew && <NewJobModal onClose={() => setShowNew(false)} onCreate={addJob} />}
+    </div>
+  );
+}
+
+class OpsCenterBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { hasError: false }; }
+  static getDerivedStateFromError() { return { hasError: true }; }
+  componentDidCatch(error) { console.error("Ops Center render error:", error); }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen flex items-center justify-center p-6" style={{ background: "#EEEDE6" }}>
+          <div className="text-center max-w-sm">
+            <div className="flex justify-center mb-3" style={{ color: "#E2600C" }}><IAlert size={22} /></div>
+            <div style={{ fontFamily: "'Oswald', sans-serif" }} className="uppercase font-semibold text-base mb-1">Something went wrong displaying this</div>
+            <p className="text-sm mb-4" style={{ color: "#5B6470" }}>Your saved job data is untouched in the database — this is just a display error.</p>
+            <button onClick={() => window.location.reload()} className="px-4 py-2 text-xs font-semibold uppercase tracking-wide rounded-sm text-white" style={{ background: "#E2600C" }}>Reload</button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<OpsCenterBoundary><OpsCenterInner /></OpsCenterBoundary>);
+</script>
+</body>
+</html>
