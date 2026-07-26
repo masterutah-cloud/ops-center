@@ -19,7 +19,7 @@
 <body>
 <div id="root"></div>
 
-<script type="text/babel" data-presets="react">
+<script type="text/plain" id="app-source">
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 
 const STATUSES = ["Estimate", "Scheduled", "In Progress", "Punch List", "Complete"];
@@ -1191,6 +1191,18 @@ class OpsCenterBoundary extends React.Component {
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<OpsCenterBoundary><OpsCenterInner /></OpsCenterBoundary>);
+</script>
+<script>
+  // Babel Standalone's automatic script-tag scanning can default to the "automatic" JSX
+  // runtime, which emits an ES module `import` statement — browsers reject that in a
+  // plain (non-module) script. Transforming manually with runtime: "classic" avoids it.
+  (function () {
+    var source = document.getElementById("app-source").textContent;
+    var output = Babel.transform(source, { presets: [["react", { runtime: "classic" }]] }).code;
+    var script = document.createElement("script");
+    script.text = output;
+    document.body.appendChild(script);
+  })();
 </script>
 </body>
 </html>
