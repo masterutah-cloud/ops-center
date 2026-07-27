@@ -1212,8 +1212,8 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
             {sheets.flatMap(s => {
               const sIsPdf = (s.type || "").includes("pdf") || (s.name || "").toLowerCase().endsWith(".pdf");
               const count = s.totalPages || 1;
-              return Array.from({ length: count }, (_, i) => i + 1).map(p => ({ sheet: s, page: p, isPdf: sIsPdf }));
-            }).filter(({ sheet, page }) => pagesFilter === "all" || (sheet.pages?.[page]?.included ?? true)).map(({ sheet, page, isPdf: pIsPdf }) => {
+              return Array.from({ length: count }, (_, i) => i + 1).map(p => ({ sheet: s, page: p, isPdf: sIsPdf, totalPages: count }));
+            }).filter(({ sheet, page }) => pagesFilter === "all" || (sheet.pages?.[page]?.included ?? true)).map(({ sheet, page, isPdf: pIsPdf, totalPages: pageCount }) => {
               const meta = sheet.pages?.[page] || { name: "", included: true };
               const thumbKey = `${sheet.id}:${page}`;
               const thumb = thumbnails[thumbKey];
@@ -1231,7 +1231,7 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
                   </button>
                   <div className="flex items-center gap-1 px-1 py-1" style={{ background: "#2B3A4D" }}>
                     <input type="checkbox" checked={meta.included ?? true} onChange={(e) => onSetPageMeta(sheet.id, page, { included: e.target.checked })} className="shrink-0" />
-                    <input defaultValue={meta.name} placeholder={pIsPdf && count > 1 ? `${sheet.name} p${page}` : sheet.name}
+                    <input defaultValue={meta.name} placeholder={pIsPdf && pageCount > 1 ? `${sheet.name} p${page}` : sheet.name}
                       onBlur={(e) => onSetPageMeta(sheet.id, page, { name: e.target.value })}
                       className="flex-1 min-w-0 text-[10px] px-1 py-0.5 rounded-sm bg-transparent text-white" style={{ border: "1px solid #3A4A5D" }} />
                   </div>
