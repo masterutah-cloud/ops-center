@@ -85,6 +85,30 @@ function polygonArea(points) {
   }
   return Math.abs(sum) / 2;
 }
+function pointToSegmentDist(p, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return Math.hypot(p.x - a.x, p.y - a.y);
+  let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+}
+function pointInPolygon(p, pts) {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const xi = pts[i].x, yi = pts[i].y, xj = pts[j].x, yj = pts[j].y;
+    const intersect = (yi > p.y) !== (yj > p.y) && p.x < ((xj - xi) * (p.y - yi)) / (yj - yi) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+// Used by Select/Edit mode to determine which measurement (if any) a click landed on.
+function hitTestMeasurement(m, x, y, threshold) {
+  if (m.type === "count") return m.points.some(p => Math.hypot(p.x - x, p.y - y) < threshold);
+  if (m.type === "area") return pointInPolygon({ x, y }, m.points) || m.points.some((p, i) => pointToSegmentDist({ x, y }, p, m.points[(i + 1) % m.points.length]) < threshold);
+  for (let i = 1; i < m.points.length; i++) if (pointToSegmentDist({ x, y }, m.points[i - 1], m.points[i]) < threshold) return true;
+  return false;
+}
 
 // PDF documents are loaded once and cached by URL, so navigating between pages
 // doesn't re-fetch the whole file — only re-renders the requested page.
@@ -98,11 +122,13 @@ async function loadPdfDoc(url) {
   return pdf;
 }
 // Renders a specific page (1-indexed) of a PDF to a data URL for display/measuring,
-// and returns the total page count so the UI can offer page navigation.
-async function renderPdfPageToDataUrl(url, pageNum) {
+// and returns the total page count so the UI can offer page navigation. `scale`
+// defaults to 2 for the main measuring view; thumbnails pass a much smaller scale
+// (e.g. 0.25) since they're only ever shown a few dozen pixels wide.
+async function renderPdfPageToDataUrl(url, pageNum, scale = 2) {
   const pdf = await loadPdfDoc(url);
   const page = await pdf.getPage(pageNum);
-  const viewport = page.getViewport({ scale: 2 });
+  const viewport = page.getViewport({ scale });
   const canvas = document.createElement("canvas");
   canvas.width = viewport.width;
   canvas.height = viewport.height;
@@ -149,6 +175,7 @@ const ICamera = (p) => <Icon {...p} d={<><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0
 const IPaperclip = (p) => <Icon {...p} d={<path d="M21 12.5 12.5 21a5 5 0 0 1-7-7L14 5.5a3.5 3.5 0 0 1 5 5L10.5 19a2 2 0 0 1-3-3L15 8.5"/>} />;
 const IRuler = (p) => <Icon {...p} d={<><path d="m16.5 21.5-14-14a2 2 0 0 1 0-2.8L4.7 2.5a2 2 0 0 1 2.8 0l14 14a2 2 0 0 1 0 2.8l-2.2 2.2a2 2 0 0 1-2.8 0Z"/><path d="m7.5 10.5 2-2M10.5 13.5l2-2M13.5 16.5l2-2"/></>} />;
 const IOpenEye = (p) => <Icon {...p} d={<><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></>} />;
+const ISelect = (p) => <Icon {...p} d={<path d="M4 3l7 17 2.2-6.8L20 11 4 3Z"/>} />;
 const ICloseEye = (p) => <Icon {...p} d={<><path d="M17.9 17.9A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a19.7 19.7 0 0 1 5-5.9M9.9 4.2A9.4 9.4 0 0 1 12 4c7 0 11 8 11 8a19.6 19.6 0 0 1-2.2 3.2M14.1 14.1a3 3 0 1 1-4.2-4.2"/><path d="M1 1l22 22"/></>} />;
 
 function Gauge({ value = 0, color = "#2B5D8C" }) {
@@ -434,7 +461,14 @@ function JobModal({ job, onClose, onUpdate, onDelete, priceBook }) {
   };
   const setSheetScale = (sheetId, page, pixelsPerFoot) => update({ takeoffSheets: takeoffSheets.map(s => s.id === sheetId ? { ...s, scales: { ...(s.scales || {}), [page]: pixelsPerFoot } } : s) });
   const saveMeasurement = (m) => update({ takeoffMeasurements: [...takeoffMeasurements, m] });
+  const updateMeasurement = (id, patch) => update({ takeoffMeasurements: takeoffMeasurements.map(m => m.id === id ? { ...m, ...patch } : m) });
   const deleteMeasurement = (id) => update({ takeoffMeasurements: takeoffMeasurements.filter(m => m.id !== id) });
+  const setPageMeta = (sheetId, page, patch) => update({
+    takeoffSheets: takeoffSheets.map(s => s.id === sheetId
+      ? { ...s, pages: { ...(s.pages || {}), [page]: { ...(s.pages?.[page] || { name: "", included: true }), ...patch } } }
+      : s)
+  });
+  const setSheetTotalPages = (sheetId, totalPages) => update({ takeoffSheets: takeoffSheets.map(s => s.id === sheetId ? { ...s, totalPages } : s) });
 
   const quantitySummary = useMemo(() => {
     const groups = {};
@@ -651,7 +685,7 @@ function JobModal({ job, onClose, onUpdate, onDelete, priceBook }) {
                 <label className="text-[11px] uppercase tracking-wide font-semibold" style={{ color: "#5B6470" }}>Plan sheets</label>
                 <button onClick={() => sheetInputRef.current?.click()} disabled={uploadingSheet}
                   className="flex items-center gap-1 text-[11px] font-semibold uppercase" style={{ color: "#2B5D8C" }}>
-                  {uploadingSheet ? <span className="animate-spin"><ILoader size={12} /></span> : <IPlus size={12} />} Add sheet
+                  {uploadingSheet ? <span className="animate-spin"><ILoader size={12} /></span> : <IPlus size={12} />} Add pages
                 </button>
                 <input type="file" accept="image/*,application/pdf" ref={sheetInputRef} className="hidden"
                   onChange={(e) => { if (e.target.files?.[0]) uploadSheet(e.target.files[0]); e.target.value = ""; }} />
@@ -770,14 +804,19 @@ function JobModal({ job, onClose, onUpdate, onDelete, priceBook }) {
         </div>
       </div>
 
-      {activeSheet && (
+      {activeSheetId && (
         <TakeoffCanvas
-          sheet={activeSheet}
-          measurements={takeoffMeasurements.filter(m => m.sheetId === activeSheet.id)}
+          sheets={takeoffSheets}
+          initialSheetId={activeSheetId}
+          measurements={takeoffMeasurements}
           onClose={() => setActiveSheetId(null)}
-          onSetScale={(page, px) => setSheetScale(activeSheet.id, page, px)}
+          onSetScale={setSheetScale}
+          onSetSheetTotalPages={setSheetTotalPages}
+          onSetPageMeta={setPageMeta}
           onSaveMeasurement={saveMeasurement}
+          onUpdateMeasurement={updateMeasurement}
           onDeleteMeasurement={deleteMeasurement}
+          onUploadSheet={uploadSheet}
           priceBook={priceBook}
           classes={takeoffClasses}
           onAddClass={addClass}
@@ -788,29 +827,42 @@ function JobModal({ job, onClose, onUpdate, onDelete, priceBook }) {
   );
 }
 
-function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasurement, onDeleteMeasurement, priceBook, classes, onAddClass, onDeleteClass }) {
+function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetScale, onSetSheetTotalPages, onSetPageMeta, onSaveMeasurement, onUpdateMeasurement, onDeleteMeasurement, onUploadSheet, priceBook, classes, onAddClass, onDeleteClass }) {
   const [imgError, setImgError] = useState("");
   const [imgReady, setImgReady] = useState(false);
   const [naturalW, setNaturalW] = useState(0);
   const [naturalH, setNaturalH] = useState(0);
   const [zoom, setZoom] = useState(1);
-  const [mode, setMode] = useState(null); // null | calibrate | line | area | count
+  const [mode, setMode] = useState(null); // null | select | calibrate | line | area | count
   const [points, setPoints] = useState([]);
-  const [pendingCalibration, setPendingCalibration] = useState(null); // { points, distancePx }
+  const [pendingCalibration, setPendingCalibration] = useState(null);
   const [calibrationFeet, setCalibrationFeet] = useState("");
-  const [labelForm, setLabelForm] = useState(null); // { type, valuePx, points }
+  const [labelForm, setLabelForm] = useState(null);
   const [selectedClassId, setSelectedClassId] = useState(null);
   const [newClassName, setNewClassName] = useState("");
-  const [currentPage, setCurrentPage] = useState(1);
-  const [totalPages, setTotalPages] = useState(1);
   const [hiddenClassIds, setHiddenClassIds] = useState(() => new Set());
+  const [currentSheetId, setCurrentSheetId] = useState(initialSheetId);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [thumbnails, setThumbnails] = useState({}); // `${sheetId}:${page}` -> dataUrl | "loading" | "error"
+  const [pagesPanelOpen, setPagesPanelOpen] = useState(true);
+  const [pagesFilter, setPagesFilter] = useState("all"); // all | inuse
+  const [selectedMeasurementId, setSelectedMeasurementId] = useState(null);
+  const [dragState, setDragState] = useState(null); // { measurementId, pointIndex, x, y }
+  const [worksheetOpen, setWorksheetOpen] = useState(false);
+  const [sortKey, setSortKey] = useState("sheetName");
+  const [sortDir, setSortDir] = useState("asc");
 
-  const isPdf = (sheet.type || "").includes("pdf") || (sheet.name || "").toLowerCase().endsWith(".pdf");
-  // Scale is stored per page, since different sheets in a multi-page plan set are
-  // often at different scales — falls back to a legacy single pixelsPerFoot value
-  // (from before multi-page support) for page 1 only.
-  const currentScale = sheet.scales?.[currentPage] ?? (currentPage === 1 ? sheet.pixelsPerFoot : undefined);
-  const pageMeasurements = measurements.filter(m => (m.page || 1) === currentPage);
+  const sheetFileInputRef = useRef(null);
+  const canvasRef = useRef(null);
+  const containerRef = useRef(null);
+  const imgElRef = useRef(null);
+
+  const currentSheet = sheets.find(s => s.id === currentSheetId) || sheets[0];
+  const isPdf = currentSheet && ((currentSheet.type || "").includes("pdf") || (currentSheet.name || "").toLowerCase().endsWith(".pdf"));
+  const totalPages = currentSheet?.totalPages || 1;
+  // Scale is stored per page — different sheets/pages in a plan set are often at different scales.
+  const currentScale = currentSheet?.scales?.[currentPage] ?? (currentPage === 1 ? currentSheet?.pixelsPerFoot : undefined);
+  const pageMeasurements = measurements.filter(m => m.sheetId === currentSheetId && (m.page || 1) === currentPage);
   const visibleMeasurements = pageMeasurements.filter(m => !hiddenClassIds.has(m.classId));
   const unitForMode = mode === "area" ? "sq ft" : mode === "count" ? "count" : "ft";
   const classesForMode = (classes || []).filter(c => c.unit === unitForMode);
@@ -821,33 +873,56 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
     return next;
   });
 
-  // Per-class totals for this page, used by the legend panel — mirrors the running
-  // totals shown next to each class in the reference tool.
   const classTotals = useMemo(() => {
     const totals = {};
     pageMeasurements.forEach(m => { if (m.classId) totals[m.classId] = (totals[m.classId] || 0) + (Number(m.value) || 0); });
     return totals;
   }, [pageMeasurements]);
 
-  const canvasRef = useRef(null);
-  const containerRef = useRef(null);
-  const imgElRef = useRef(null);
-
-  // Load the current page — render PDFs to an image first, use uploaded images directly.
+  // Ensure every sheet's page count is known, then lazily render a small thumbnail
+  // for each PDF page (images are shown directly, no pre-render needed). Runs once
+  // per change to the set of sheets, not on every thumbnail — avoids re-triggering itself.
   useEffect(() => {
     let cancelled = false;
-    setImgReady(false); setImgError(""); setMode(null); setPoints([]);
+    (async () => {
+      for (const s of sheets) {
+        const sIsPdf = (s.type || "").includes("pdf") || (s.name || "").toLowerCase().endsWith(".pdf");
+        let count = s.totalPages;
+        if (!count) {
+          if (sIsPdf) {
+            try { count = (await loadPdfDoc(s.url)).numPages; } catch (e) { count = 1; }
+          } else count = 1;
+          if (cancelled) return;
+          onSetSheetTotalPages(s.id, count);
+        }
+        if (sIsPdf) {
+          for (let p = 1; p <= Math.min(count, 50); p++) {
+            const key = `${s.id}:${p}`;
+            if (thumbnails[key]) continue;
+            setThumbnails(t => ({ ...t, [key]: "loading" }));
+            try {
+              const { dataUrl } = await renderPdfPageToDataUrl(s.url, p, 0.25);
+              if (cancelled) return;
+              setThumbnails(t => ({ ...t, [key]: dataUrl }));
+            } catch (e) {
+              if (!cancelled) setThumbnails(t => ({ ...t, [key]: "error" }));
+            }
+          }
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sheets.map(s => s.id).join(",")]);
+
+  // Load the current page into the main canvas — render PDFs to an image, use uploaded images directly.
+  useEffect(() => {
+    if (!currentSheet) return;
+    let cancelled = false;
+    setImgReady(false); setImgError(""); setMode(null); setPoints([]); setSelectedMeasurementId(null);
     (async () => {
       try {
-        let src;
-        if (isPdf) {
-          const result = await renderPdfPageToDataUrl(sheet.url, currentPage);
-          if (cancelled) return;
-          setTotalPages(result.numPages);
-          src = result.dataUrl;
-        } else {
-          src = sheet.url;
-        }
+        const src = isPdf ? (await renderPdfPageToDataUrl(currentSheet.url, currentPage)).dataUrl : currentSheet.url;
         const img = new Image();
         img.onload = () => {
           if (cancelled) return;
@@ -864,7 +939,7 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
       }
     })();
     return () => { cancelled = true; };
-  }, [sheet.id, sheet.url, currentPage]);
+  }, [currentSheetId, currentPage]);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current, img = imgElRef.current;
@@ -875,9 +950,10 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
     ctx.save(); ctx.scale(zoom, zoom);
     ctx.drawImage(img, 0, 0, naturalW, naturalH);
 
-    const drawShape = (pts, type, color, label) => {
+    const drawShape = (pts, type, color, label, dashed) => {
       if (!pts.length) return;
-      ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2 / zoom;
+      ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = (dashed ? 3 : 2) / zoom;
+      ctx.setLineDash(dashed ? [6 / zoom, 4 / zoom] : []);
       if (type === "count") {
         pts.forEach((p, i) => {
           ctx.beginPath(); ctx.arc(p.x, p.y, 7 / zoom, 0, Math.PI * 2); ctx.fill();
@@ -892,6 +968,7 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
         ctx.stroke();
         pts.forEach(p => { ctx.beginPath(); ctx.arc(p.x, p.y, 4 / zoom, 0, Math.PI * 2); ctx.fill(); });
       }
+      ctx.setLineDash([]);
       if (label) {
         const mid = pts[Math.floor((pts.length - 1) / 2)];
         ctx.font = (13 / zoom) + "px sans-serif"; ctx.fillStyle = "#1A2332"; ctx.textAlign = "left";
@@ -901,30 +978,29 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
 
     visibleMeasurements.forEach(m => {
       const cls = (classes || []).find(c => c.id === m.classId);
-      drawShape(m.points, m.type, cls?.color || "#2B5D8C", `${m.label} (${m.value} ${m.unit})`);
+      const isDraggingThis = dragState && dragState.measurementId === m.id;
+      const pts = isDraggingThis ? m.points.map((p, i) => i === dragState.pointIndex ? { x: dragState.x, y: dragState.y } : p) : m.points;
+      drawShape(pts, m.type, cls?.color || "#2B5D8C", `${m.label} (${m.value} ${m.unit})`, m.id === selectedMeasurementId);
     });
     if (points.length) drawShape(points, mode === "calibrate" ? "line" : mode, "#E2600C", null);
     if (pendingCalibration) drawShape(pendingCalibration.points, "line", "#E2600C", null);
     ctx.restore();
-  }, [naturalW, naturalH, zoom, points, mode, visibleMeasurements, classes, pendingCalibration]);
+  }, [naturalW, naturalH, zoom, points, mode, visibleMeasurements, classes, pendingCalibration, dragState, selectedMeasurementId]);
 
   useEffect(() => { if (imgReady) draw(); }, [imgReady, draw]);
 
-  // Undo removes only the last placed point of the shape currently being drawn —
-  // deliberately scoped to in-progress drawing, not a full app history stack, since
-  // saved measurements already have their own delete control in the legend panel.
   const undoLastPoint = () => setPoints(p => p.slice(0, -1));
   useEffect(() => {
     const onKeyDown = (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "z" && points.length > 0) { e.preventDefault(); undoLastPoint(); }
+      if ((e.metaKey || e.ctrlKey) && e.key === "z" && points.length > 0) { e.preventDefault(); undoLastPoint(); return; }
+      if ((e.key === "Delete" || e.key === "Backspace") && mode === "select" && selectedMeasurementId) {
+        e.preventDefault(); onDeleteMeasurement(selectedMeasurementId); setSelectedMeasurementId(null);
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [points.length]);
+  }, [points.length, mode, selectedMeasurementId]);
 
-  // Snaps a raw click to a nearby existing vertex (from saved measurements on this page,
-  // or points already placed in the shape being drawn) so connected runs — e.g. a curb
-  // line continuing where the last one ended — line up exactly instead of by eye.
   const SNAP_SCREEN_PX = 10;
   const findSnapPoint = (x, y) => {
     const thresholdNatural = SNAP_SCREEN_PX / zoom;
@@ -939,12 +1015,16 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
     return best;
   };
 
-  const handleClick = (e) => {
-    if (!mode || labelForm || pendingCalibration) return;
+  const getCanvasCoords = (e) => {
     const rect = canvasRef.current.getBoundingClientRect();
-    const rawX = (e.clientX - rect.left) / zoom, rawY = (e.clientY - rect.top) / zoom;
-    const snap = findSnapPoint(rawX, rawY);
-    const { x, y } = snap || { x: rawX, y: rawY };
+    return { x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom };
+  };
+
+  const handleClick = (e) => {
+    if (mode === "select" || !mode || labelForm || pendingCalibration) return;
+    const raw = getCanvasCoords(e);
+    const snap = findSnapPoint(raw.x, raw.y);
+    const { x, y } = snap || raw;
     if (mode === "calibrate") {
       const next = [...points, { x, y }];
       if (next.length === 2) { setPendingCalibration({ points: next, distancePx: polylineLength(next) }); setPoints([]); }
@@ -954,8 +1034,47 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
     setPoints(p => [...p, { x, y }]);
   };
 
+  const handleMouseDown = (e) => {
+    if (mode !== "select") return;
+    const { x, y } = getCanvasCoords(e);
+    const threshold = 10 / zoom;
+    let found = null, bestDist = threshold;
+    pageMeasurements.forEach(m => {
+      m.points.forEach((p, idx) => {
+        const d = Math.hypot(p.x - x, p.y - y);
+        if (d < bestDist) { bestDist = d; found = { measurementId: m.id, pointIndex: idx }; }
+      });
+    });
+    if (found) {
+      setDragState({ ...found, x, y });
+      setSelectedMeasurementId(found.measurementId);
+      return;
+    }
+    const hit = pageMeasurements.find(m => hitTestMeasurement(m, x, y, threshold));
+    setSelectedMeasurementId(hit ? hit.id : null);
+  };
+  const handleMouseMove = (e) => {
+    if (!dragState) return;
+    const { x, y } = getCanvasCoords(e);
+    setDragState(s => ({ ...s, x, y }));
+  };
+  const handleMouseUp = () => {
+    if (!dragState) return;
+    const m = measurements.find(mm => mm.id === dragState.measurementId);
+    if (m) {
+      const newPoints = m.points.map((p, i) => i === dragState.pointIndex ? { x: dragState.x, y: dragState.y } : p);
+      let value = m.value;
+      if (currentScale) {
+        if (m.type === "line") value = Math.round((polylineLength(newPoints) / currentScale) * 10) / 10;
+        else if (m.type === "area") value = Math.round((polygonArea(newPoints) / (currentScale ** 2)) * 10) / 10;
+      }
+      onUpdateMeasurement(m.id, { points: newPoints, value });
+    }
+    setDragState(null);
+  };
+
   const minPoints = mode === "area" ? 3 : mode === "count" ? 1 : 2;
-  const canFinish = mode && mode !== "calibrate" && points.length >= minPoints;
+  const canFinish = mode && mode !== "calibrate" && mode !== "select" && points.length >= minPoints;
 
   const priceMatch = selectedClassId ? (() => {
     const cls = (classes || []).find(c => c.id === selectedClassId);
@@ -980,31 +1099,56 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
     if (labelForm.type === "line") { value = Math.round((labelForm.valuePx / currentScale) * 10) / 10; unit = "ft"; }
     else if (labelForm.type === "area") { value = Math.round((labelForm.valuePx / (currentScale ** 2)) * 10) / 10; unit = "sq ft"; }
     else { value = labelForm.valuePx; unit = "count"; }
-    const sheetName = totalPages > 1 ? `${sheet.name} (p${currentPage})` : sheet.name;
-    onSaveMeasurement({ id: uid(), sheetId: sheet.id, sheetName, page: currentPage, type: labelForm.type, classId: cls.id, label: cls.name, value, unit, points: labelForm.points });
+    const pageName = currentSheet.pages?.[currentPage]?.name;
+    const sheetName = pageName || (totalPages > 1 ? `${currentSheet.name} (p${currentPage})` : currentSheet.name);
+    onSaveMeasurement({ id: uid(), sheetId: currentSheetId, sheetName, page: currentPage, type: labelForm.type, classId: cls.id, label: cls.name, value, unit, points: labelForm.points });
     setLabelForm(null); setPoints([]); setMode(null); setSelectedClassId(null); setNewClassName("");
   };
 
   const confirmCalibration = () => {
     const feet = Number(calibrationFeet);
     if (!feet || feet <= 0) return;
-    onSetScale(currentPage, pendingCalibration.distancePx / feet);
+    onSetScale(currentSheetId, currentPage, pendingCalibration.distancePx / feet);
     setPendingCalibration(null); setCalibrationFeet(""); setMode(null);
   };
 
   const toolBtn = (m, label, Ic) => (
-    <button onClick={() => { setMode(m); setPoints([]); }}
-      className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold uppercase tracking-wide rounded-sm"
-      style={{ background: mode === m ? "#1A2332" : "#EEEDE6", color: mode === m ? "white" : "#5B6470" }}>
-      <Ic size={13} /> {label}
+    <button onClick={() => { setMode(mode === m ? null : m); setPoints([]); setSelectedMeasurementId(null); }}
+      className="flex flex-col items-center gap-0.5 px-2.5 py-1.5 rounded-sm min-w-[52px]"
+      style={{ background: mode === m ? "#1A2332" : "transparent", color: mode === m ? "white" : "#C9D2DC" }}>
+      <Ic size={16} />
+      <span className="text-[9px] uppercase tracking-wide font-semibold">{label}</span>
     </button>
   );
 
+  const sortedAllMeasurements = useMemo(() => {
+    const list = [...measurements];
+    list.sort((a, b) => {
+      let av = a[sortKey], bv = b[sortKey];
+      if (typeof av === "string") av = av.toLowerCase();
+      if (typeof bv === "string") bv = bv.toLowerCase();
+      if (av == null) av = "";
+      if (bv == null) bv = "";
+      if (av < bv) return sortDir === "asc" ? -1 : 1;
+      if (av > bv) return sortDir === "asc" ? 1 : -1;
+      return 0;
+    });
+    return list;
+  }, [measurements, sortKey, sortDir]);
+  const toggleSort = (key) => { if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc"); else { setSortKey(key); setSortDir("asc"); } };
+  const sortHeader = (key, label) => (
+    <button onClick={() => toggleSort(key)} className="flex items-center gap-1 text-left">
+      {label} {sortKey === key && <span>{sortDir === "asc" ? "▲" : "▼"}</span>}
+    </button>
+  );
+
+  if (!currentSheet) return null;
+
   return (
     <div className="fixed inset-0 z-[60] flex flex-col" style={{ background: "#1A2332" }}>
-      <div className="flex items-center justify-between px-4 py-2.5 shrink-0">
-        <div className="text-white text-sm font-semibold truncate pr-3">{sheet.name}</div>
-        <div className="flex items-center gap-2 shrink-0">
+      <div className="flex items-center justify-between px-4 py-2.5 shrink-0 border-b" style={{ borderColor: "#2B3A4D" }}>
+        <div className="text-white text-sm font-semibold truncate pr-3">{currentSheet.name}{totalPages > 1 ? ` — page ${currentPage}/${totalPages}` : ""}</div>
+        <div className="flex items-center gap-3 shrink-0">
           <span className="text-[11px]" style={{ color: currentScale ? "#8BD1A8" : "#E8B23D" }}>
             {currentScale ? "Scale set" : "Not calibrated"}
           </span>
@@ -1012,38 +1156,101 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2 px-4 pb-2.5 shrink-0">
-        {totalPages > 1 && (
-          <div className="flex items-center gap-1 mr-1">
-            <button onClick={() => setCurrentPage(p => Math.max(1, p - 1))} disabled={currentPage === 1}
-              className="px-2 py-1 rounded-sm text-white text-xs disabled:opacity-30" style={{ background: "#2B5D8C" }}>‹</button>
-            <span className="text-[11px] text-white px-1">Page {currentPage} / {totalPages}</span>
-            <button onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}
-              className="px-2 py-1 rounded-sm text-white text-xs disabled:opacity-30" style={{ background: "#2B5D8C" }}>›</button>
-          </div>
-        )}
-        {toolBtn("calibrate", "Calibrate", IRuler)}
+      <div className="flex flex-wrap items-center gap-1 px-3 py-1.5 shrink-0 border-b" style={{ borderColor: "#2B3A4D" }}>
+        {toolBtn("select", "Select", ISelect)}
+        <div className="w-px h-7 mx-1" style={{ background: "#2B3A4D" }} />
+        {toolBtn("calibrate", "Scale", IRuler)}
         {toolBtn("line", "Line", IRuler)}
         {toolBtn("area", "Area", IGrid)}
         {toolBtn("count", "Count", IList)}
-        <div className="flex items-center gap-1 ml-1">
-          <button onClick={() => setZoom(z => Math.max(0.1, z - 0.15))} className="px-2 py-1 rounded-sm text-white text-xs" style={{ background: "#2B5D8C" }}>−</button>
-          <span className="text-[11px] text-white w-10 text-center">{Math.round(zoom * 100)}%</span>
-          <button onClick={() => setZoom(z => Math.min(4, z + 0.15))} className="px-2 py-1 rounded-sm text-white text-xs" style={{ background: "#2B5D8C" }}>+</button>
+        <div className="w-px h-7 mx-1" style={{ background: "#2B3A4D" }} />
+        <div className="flex flex-col items-center gap-0.5 px-2.5 py-1.5 min-w-[80px]">
+          <div className="flex items-center gap-1">
+            <button onClick={() => setZoom(z => Math.max(0.1, z - 0.15))} className="px-1.5 rounded-sm text-white text-xs" style={{ background: "#2B5D8C" }}>−</button>
+            <span className="text-[11px] text-white w-9 text-center">{Math.round(zoom * 100)}%</span>
+            <button onClick={() => setZoom(z => Math.min(4, z + 0.15))} className="px-1.5 rounded-sm text-white text-xs" style={{ background: "#2B5D8C" }}>+</button>
+          </div>
+          <span className="text-[9px] uppercase tracking-wide font-semibold" style={{ color: "#C9D2DC" }}>Zoom</span>
         </div>
+        <div className="w-px h-7 mx-1" style={{ background: "#2B3A4D" }} />
         {canFinish && <button onClick={handleFinish} className="px-3 py-1.5 rounded-sm text-white text-xs font-semibold uppercase" style={{ background: "#4A7856" }}>Finish</button>}
-        {points.length > 0 && <button onClick={undoLastPoint} title="Undo last point (Cmd/Ctrl+Z)" className="px-2.5 py-1.5 rounded-sm text-xs font-semibold uppercase" style={{ background: "#EEEDE6", color: "#5B6470" }}>↩ Undo point</button>}
-        {mode && <button onClick={handleCancel} className="px-3 py-1.5 rounded-sm text-xs font-semibold uppercase" style={{ background: "#EEEDE6", color: "#5B6470" }}>Cancel</button>}
-        {mode && <span className="text-[11px]" style={{ color: "#8B96A5" }}>
-          {mode === "calibrate" ? "Click 2 points spanning a known distance" : `Click to place points${mode !== "count" ? ", then Finish" : " (each click = 1 item), then Finish"}`}
-        </span>}
+        {points.length > 0 && <button onClick={undoLastPoint} title="Undo last point (Cmd/Ctrl+Z)" className="px-2.5 py-1.5 rounded-sm text-xs font-semibold uppercase" style={{ background: "#2B3A4D", color: "#C9D2DC" }}>↩ Undo</button>}
+        {mode === "select" && selectedMeasurementId && (
+          <button onClick={() => { onDeleteMeasurement(selectedMeasurementId); setSelectedMeasurementId(null); }}
+            className="px-2.5 py-1.5 rounded-sm text-xs font-semibold uppercase" style={{ background: "#7A2E1A", color: "white" }}>
+            Delete selected
+          </button>
+        )}
+        {mode && mode !== "select" && <button onClick={handleCancel} className="px-3 py-1.5 rounded-sm text-xs font-semibold uppercase" style={{ background: "#2B3A4D", color: "#C9D2DC" }}>Cancel</button>}
+        {mode && (
+          <span className="text-[11px] ml-1" style={{ color: "#8B96A5" }}>
+            {mode === "calibrate" ? "Click 2 points spanning a known distance"
+              : mode === "select" ? "Click a point to drag it, or a shape to select — Delete key removes it"
+              : `Click to place points${mode !== "count" ? ", then Finish" : " (each click = 1 item), then Finish"}`}
+          </span>
+        )}
       </div>
 
       <div className="flex-1 flex overflow-hidden">
+        {pagesPanelOpen && (
+          <div className="w-48 shrink-0 border-r overflow-y-auto p-2.5 flex flex-col gap-2" style={{ borderColor: "#2B3A4D", background: "#1F2A3A" }}>
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] uppercase tracking-wide font-semibold" style={{ color: "#8B96A5" }}>Pages</span>
+              <button onClick={() => sheetFileInputRef.current?.click()} className="text-[10px] font-semibold uppercase" style={{ color: "#8BD1A8" }}>+ Add</button>
+              <input type="file" accept="image/*,application/pdf" ref={sheetFileInputRef} className="hidden"
+                onChange={(e) => { if (e.target.files?.[0]) onUploadSheet(e.target.files[0]); e.target.value = ""; }} />
+            </div>
+            <div className="flex gap-1">
+              {["all", "inuse"].map(f => (
+                <button key={f} onClick={() => setPagesFilter(f)}
+                  className="flex-1 text-[9px] uppercase font-semibold py-1 rounded-sm"
+                  style={{ background: pagesFilter === f ? "#2B5D8C" : "#2B3A4D", color: pagesFilter === f ? "white" : "#8B96A5" }}>
+                  {f === "all" ? "All" : "In use"}
+                </button>
+              ))}
+            </div>
+            {sheets.flatMap(s => {
+              const sIsPdf = (s.type || "").includes("pdf") || (s.name || "").toLowerCase().endsWith(".pdf");
+              const count = s.totalPages || 1;
+              return Array.from({ length: count }, (_, i) => i + 1).map(p => ({ sheet: s, page: p, isPdf: sIsPdf }));
+            }).filter(({ sheet, page }) => pagesFilter === "all" || (sheet.pages?.[page]?.included ?? true)).map(({ sheet, page, isPdf: pIsPdf }) => {
+              const meta = sheet.pages?.[page] || { name: "", included: true };
+              const thumbKey = `${sheet.id}:${page}`;
+              const thumb = thumbnails[thumbKey];
+              const isActive = sheet.id === currentSheetId && page === currentPage;
+              return (
+                <div key={thumbKey} className="rounded-sm overflow-hidden" style={{ border: isActive ? "2px solid #E2600C" : "1px solid #2B3A4D" }}>
+                  <button onClick={() => { setCurrentSheetId(sheet.id); setCurrentPage(page); }} className="w-full block" style={{ background: "#111826" }}>
+                    {pIsPdf ? (
+                      thumb && thumb !== "loading" && thumb !== "error"
+                        ? <img src={thumb} alt="" className="w-full h-24 object-contain" />
+                        : <div className="w-full h-24 flex items-center justify-center">{thumb === "error" ? <span className="text-[10px]" style={{ color: "#E2600C" }}>Failed</span> : <span className="animate-spin"><ILoader size={14} color="#8B96A5" /></span>}</div>
+                    ) : (
+                      <img src={sheet.url} alt="" className="w-full h-24 object-contain" />
+                    )}
+                  </button>
+                  <div className="flex items-center gap-1 px-1 py-1" style={{ background: "#2B3A4D" }}>
+                    <input type="checkbox" checked={meta.included ?? true} onChange={(e) => onSetPageMeta(sheet.id, page, { included: e.target.checked })} className="shrink-0" />
+                    <input defaultValue={meta.name} placeholder={pIsPdf && count > 1 ? `${sheet.name} p${page}` : sheet.name}
+                      onBlur={(e) => onSetPageMeta(sheet.id, page, { name: e.target.value })}
+                      className="flex-1 min-w-0 text-[10px] px-1 py-0.5 rounded-sm bg-transparent text-white" style={{ border: "1px solid #3A4A5D" }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <button onClick={() => setPagesPanelOpen(o => !o)} className="w-3 shrink-0 flex items-center justify-center" style={{ background: "#1F2A3A", color: "#8B96A5" }}>
+          {pagesPanelOpen ? "‹" : "›"}
+        </button>
+
         <div ref={containerRef} className="flex-1 overflow-auto p-4">
           {imgError && <div className="text-white text-sm">{imgError}</div>}
           {!imgReady && !imgError && <div className="text-white text-sm flex items-center gap-2"><span className="animate-spin"><ILoader size={16} /></span> Loading sheet…</div>}
-          {imgReady && <canvas ref={canvasRef} onClick={handleClick} style={{ cursor: mode ? "crosshair" : "default", display: "block" }} />}
+          {imgReady && (
+            <canvas ref={canvasRef} onClick={handleClick} onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp}
+              style={{ cursor: mode === "select" ? "pointer" : mode ? "crosshair" : "default", display: "block" }} />
+          )}
         </div>
 
         <div className="w-56 shrink-0 border-l overflow-y-auto p-3" style={{ borderColor: "#2B3A4D", background: "#1F2A3A" }}>
@@ -1059,7 +1266,7 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
                     {hiddenClassIds.has(c.id) ? <ICloseEye size={13} color="#8B96A5" /> : <IOpenEye size={13} color="#C9D2DC" />}
                   </button>
                   <span className="flex-1 min-w-0 truncate text-[11px] text-white">{c.name}</span>
-                  <span style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="text-[10px] shrink-0" >
+                  <span style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="text-[10px] shrink-0">
                     {(classTotals[c.id] || 0).toLocaleString()}{c.unit === "count" ? "" : ` ${c.unit}`}
                   </span>
                   <button onClick={() => onDeleteClass(c.id)} className="shrink-0"><IX size={11} color="#8B96A5" /></button>
@@ -1069,6 +1276,44 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
           )}
         </div>
       </div>
+
+      <div className="flex justify-center shrink-0 -mt-3 relative z-10">
+        <button onClick={() => setWorksheetOpen(o => !o)}
+          className="flex items-center gap-1.5 px-4 py-1.5 rounded-t-sm text-xs font-semibold uppercase tracking-wide"
+          style={{ background: "#1F2A3A", color: "#C9D2DC" }}>
+          Worksheet {worksheetOpen ? "▾" : "▴"}
+        </button>
+      </div>
+      {worksheetOpen && (
+        <div className="shrink-0 overflow-y-auto border-t" style={{ height: 220, background: "#1F2A3A", borderColor: "#2B3A4D" }}>
+          {measurements.length === 0 ? (
+            <div className="p-4 text-[11px]" style={{ color: "#8B96A5" }}>No measurements yet across any page.</div>
+          ) : (
+            <table className="w-full text-[11px] text-white">
+              <thead className="sticky top-0" style={{ background: "#2B3A4D" }}>
+                <tr>
+                  <th className="text-left px-3 py-1.5 font-semibold">{sortHeader("label", "Class")}</th>
+                  <th className="text-left px-3 py-1.5 font-semibold">{sortHeader("sheetName", "Page")}</th>
+                  <th className="text-left px-3 py-1.5 font-semibold">{sortHeader("type", "Type")}</th>
+                  <th className="text-right px-3 py-1.5 font-semibold">{sortHeader("value", "Value")}</th>
+                  <th className="px-3 py-1.5"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {sortedAllMeasurements.map(m => (
+                  <tr key={m.id} className="border-t" style={{ borderColor: "#2B3A4D" }}>
+                    <td className="px-3 py-1.5">{m.label}</td>
+                    <td className="px-3 py-1.5" style={{ color: "#8B96A5" }}>{m.sheetName}</td>
+                    <td className="px-3 py-1.5 capitalize" style={{ color: "#8B96A5" }}>{m.type}</td>
+                    <td className="px-3 py-1.5 text-right" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{m.value} {m.unit}</td>
+                    <td className="px-3 py-1.5 text-right"><button onClick={() => onDeleteMeasurement(m.id)}><IX size={12} color="#8B96A5" /></button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
 
       {pendingCalibration && (
         <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-white rounded-sm p-3 shadow-lg flex items-center gap-2">
@@ -1117,6 +1362,7 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
     </div>
   );
 }
+
 
 function KPI({ label, value, icon: Ic, color }) {
   return (
