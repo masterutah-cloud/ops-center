@@ -436,7 +436,7 @@ function JobModal({ job, onClose, onUpdate, onDelete, priceBook }) {
   const [newTask, setNewTask] = useState("");
   const [newTaskAssignee, setNewTaskAssignee] = useState("");
   const [newAppt, setNewAppt] = useState({ title: "", date: todayStr(), time: "09:00", type: "Site Visit" });
-  const update = (patch) => onUpdate({ ...job, ...patch });
+  const update = (patch) => onUpdate(patch);
   const addTask = () => {
     if (!newTask.trim()) return;
     update({ tasks: [...(job.tasks || []), { id: uid(), text: newTask.trim(), done: false, assignee: newTaskAssignee.trim(), due: "" }] });
@@ -935,6 +935,7 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
   const [currentSheetId, setCurrentSheetId] = useState(initialSheetId);
   const [currentPage, setCurrentPage] = useState(1);
   const [thumbnails, setThumbnails] = useState({}); // `${sheetId}:${page}` -> dataUrl | "loading" | "error"
+  const [thumbnailRetryTick, setThumbnailRetryTick] = useState(0);
   const [pagesPanelOpen, setPagesPanelOpen] = useState(true);
   const [pagesFilter, setPagesFilter] = useState("inuse"); // all | inuse
   const [selectedMeasurementId, setSelectedMeasurementId] = useState(null);
@@ -986,12 +987,15 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
   }, [sheets, thumbnails]);
 
   // Ensure every sheet's page count is known, then lazily render a small thumbnail
-  // for each PDF page (images are shown directly, no pre-render needed). Runs once
-  // per change to the set of sheets, not on every thumbnail — avoids re-triggering itself.
+  // for each PDF page (images are shown directly, no pre-render needed). Re-runs
+  // whenever the sheet list OR any page's included/name metadata changes — e.g. right
+  // after using "Select pages to use" — so newly-included pages actually get thumbnails
+  // instead of waiting for the sheet list itself to change.
   // Updates are batched (flushed every few pages, with a yield in between) instead of
   // one state update per page — with large plan sets (50+ pages) updating on every
   // single page caused enough back-to-back re-renders that the whole panel felt frozen
   // and clicks seemed to stop working, even though nothing had actually crashed.
+  const sheetsFingerprint = sheets.map(s => `${s.id}:${s.totalPages || 0}:${Object.entries(s.pages || {}).map(([p, m]) => `${p}=${m.included !== false ? 1 : 0}`).join(",")}`).join("|");
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -1008,7 +1012,10 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
           onSetSheetTotalPages(s.id, count);
         }
         if (sIsPdf) {
-          for (let p = 1; p <= count; p++) {
+          // Included pages first, so the ones actually being worked on show up before the rest.
+          const pageOrder = Array.from({ length: count }, (_, i) => i + 1)
+            .sort((a, b) => (s.pages?.[a]?.included === false ? 1 : 0) - (s.pages?.[b]?.included === false ? 1 : 0));
+          for (const p of pageOrder) {
             const key = `${s.id}:${p}`;
             if (thumbnails[key] || pending[key]) continue;
             if (s.pages?.[p]?.included === false) continue; // user explicitly excluded this page — don't waste time rendering it
@@ -1027,7 +1034,7 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sheets.map(s => s.id).join(",")]);
+  }, [sheetsFingerprint, thumbnailRetryTick]);
 
   // Load the current page into the main canvas — render PDFs to an image, use uploaded images directly.
   useEffect(() => {
@@ -1160,9 +1167,52 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
       });
     });
     if (found) {
+      // Alt/Option+click a point removes just that point, instead of dragging it —
+      // this is the "resize" half of reshaping a saved measurement.
+      if (e.altKey) {
+        const m = measurements.find(mm => mm.id === found.measurementId);
+        const minPts = m.type === "area" ? 3 : m.type === "count" ? 1 : 2;
+        if (m.points.length <= minPts) { alert(`Can't remove — a ${m.type} needs at least ${minPts} point${minPts > 1 ? "s" : ""}.`); return; }
+        const newPoints = m.points.filter((_, i) => i !== found.pointIndex);
+        let value = m.value;
+        if (currentScale) {
+          if (m.type === "line") value = Math.round((polylineLength(newPoints) / currentScale) * 10) / 10;
+          else if (m.type === "area") value = Math.round((polygonArea(newPoints) / (currentScale ** 2)) * 10) / 10;
+          else value = newPoints.length;
+        } else if (m.type === "count") value = newPoints.length;
+        onUpdateMeasurement(m.id, { points: newPoints, value });
+        return;
+      }
       setDragState({ ...found, x, y });
       setSelectedMeasurementId(found.measurementId);
       return;
+    }
+    // Clicking near an edge of the *already-selected* shape inserts a new point there
+    // instead of just re-selecting — this is the "add point" tool: select a shape once,
+    // then click along its outline wherever it needs an extra point to reshape correctly.
+    if (selectedMeasurementId) {
+      const selectedM = measurements.find(mm => mm.id === selectedMeasurementId && mm.sheetId === currentSheetId && (mm.page || 1) === currentPage);
+      if (selectedM && selectedM.type !== "count") {
+        const pts = selectedM.points;
+        const n = pts.length;
+        const segCount = selectedM.type === "area" ? n : n - 1;
+        let bestSeg = null, bestSegDist = threshold;
+        for (let i = 0; i < segCount; i++) {
+          const a = pts[i], b = pts[(i + 1) % n];
+          const d = pointToSegmentDist({ x, y }, a, b);
+          if (d < bestSegDist) { bestSegDist = d; bestSeg = i; }
+        }
+        if (bestSeg !== null) {
+          const newPoints = [...pts.slice(0, bestSeg + 1), { x, y }, ...pts.slice(bestSeg + 1)];
+          let value = selectedM.value;
+          if (currentScale) {
+            if (selectedM.type === "line") value = Math.round((polylineLength(newPoints) / currentScale) * 10) / 10;
+            else if (selectedM.type === "area") value = Math.round((polygonArea(newPoints) / (currentScale ** 2)) * 10) / 10;
+          }
+          onUpdateMeasurement(selectedM.id, { points: newPoints, value });
+          return;
+        }
+      }
     }
     const hit = pageMeasurements.find(m => hitTestMeasurement(m, x, y, threshold));
     setSelectedMeasurementId(hit ? hit.id : null);
@@ -1190,10 +1240,20 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
   const minPoints = mode === "area" ? 3 : mode === "count" ? 1 : 2;
   const canFinish = mode && mode !== "calibrate" && mode !== "select" && points.length >= minPoints;
 
-  const priceMatch = selectedClassId ? (() => {
-    const cls = (classes || []).find(c => c.id === selectedClassId);
-    return cls ? (priceBook || []).find(p => p.name.toLowerCase() === cls.name.toLowerCase() && p.unit === cls.unit) : null;
-  })() : null;
+  const priceMatch = (() => {
+    let name, unit;
+    if (selectedClassId) {
+      const cls = (classes || []).find(c => c.id === selectedClassId);
+      if (!cls) return null;
+      name = cls.name; unit = cls.unit;
+    } else if (newClassName.trim() && labelForm) {
+      name = newClassName.trim();
+      unit = labelForm.type === "line" ? "ft" : labelForm.type === "area" ? "sq ft" : "count";
+    } else {
+      return null;
+    }
+    return (priceBook || []).find(p => p.name.toLowerCase() === name.toLowerCase() && p.unit === unit) || null;
+  })();
 
   const handleFinish = () => {
     if (mode !== "count" && !currentScale) { alert("Calibrate this sheet's scale first (use the Calibrate tool)."); return; }
@@ -1299,7 +1359,7 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
         {mode && (
           <span className="text-[11px] ml-1" style={{ color: "#8B96A5" }}>
             {mode === "calibrate" ? "Click 2 points spanning a known distance"
-              : mode === "select" ? "Click a point to drag it, or a shape to select — Delete key removes it"
+              : mode === "select" ? "Click+drag a point to move it · Alt+click a point to remove it · Select a shape, then click its edge to add a point · Delete key removes the whole shape"
               : `Click to place points${mode !== "count" ? ", then Finish" : " (each click = 1 item), then Finish"}`}
           </span>
         )}
@@ -1325,6 +1385,12 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
             </div>
             {thumbnailProgress.total > 0 && thumbnailProgress.done < thumbnailProgress.total && (
               <div className="text-[9px]" style={{ color: "#8B96A5" }}>Loading previews… {thumbnailProgress.done}/{thumbnailProgress.total}</div>
+            )}
+            {Object.values(thumbnails).some(v => v === "error") && (
+              <button onClick={() => { setThumbnails(t => { const n = { ...t }; Object.keys(n).forEach(k => { if (n[k] === "error") delete n[k]; }); return n; }); setThumbnailRetryTick(t => t + 1); }}
+                className="text-[9px] font-semibold uppercase text-left" style={{ color: "#E8B23D" }}>
+                ↻ Retry failed previews
+              </button>
             )}
             {sheets.flatMap(s => {
               const sIsPdf = (s.type || "").includes("pdf") || (s.name || "").toLowerCase().endsWith(".pdf");
@@ -1583,8 +1649,24 @@ function OpsCenterInner() {
     return true;
   }, [attemptSave, loadStatus]);
 
+  // Patches a single job by id using React's *functional* state update form. This matters
+  // because a single user action (e.g. labeling a takeoff measurement) can trigger two
+  // patches back-to-back in the same tick — creating a class, then saving a measurement
+  // that references it. With a plain (non-functional) update, the second patch would
+  // overwrite the first using a stale snapshot of the job, silently erasing the class
+  // that was just created. The functional form guarantees each patch always applies on
+  // top of the truly latest state, regardless of how many patches fire in the same tick.
+  const patchJob = useCallback((jobId, patch) => {
+    if (loadStatus === "error") return false;
+    setJobs(prev => {
+      const next = prev.map(j => j.id === jobId ? { ...j, ...patch } : j);
+      attemptSave(next);
+      return next;
+    });
+    return true;
+  }, [attemptSave, loadStatus]);
+
   const addJob = (job) => { if (persist([job, ...jobs])) setShowNew(false); };
-  const updateJob = (job) => persist(jobs.map(j => j.id === job.id ? job : j));
   const deleteJob = (id) => { if (persist(jobs.filter(j => j.id !== id))) setSelectedId(null); };
 
   const handleExport = () => {
@@ -1791,7 +1873,7 @@ function OpsCenterInner() {
         )}
       </div>
 
-      {selectedJob && <JobModal job={selectedJob} onClose={() => setSelectedId(null)} onUpdate={updateJob} onDelete={deleteJob} priceBook={priceBook} />}
+      {selectedJob && <JobModal job={selectedJob} onClose={() => setSelectedId(null)} onUpdate={(patch) => patchJob(selectedJob.id, patch)} onDelete={deleteJob} priceBook={priceBook} />}
       {showPriceBook && <PriceBookModal items={priceBook} onChange={updatePriceBook} onClose={() => setShowPriceBook(false)} />}
       {showNew && <NewJobModal onClose={() => setShowNew(false)} onCreate={addJob} />}
     </div>
