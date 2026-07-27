@@ -128,8 +128,13 @@ app.delete("/api/upload/*", async (req, res) => {
   }
 });
 
-app.use(express.static(path.join(__dirname, "public")));
-app.get("*", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
+// noCache: prevents any layer (browser, Railway's edge, etc.) from serving a stale
+// version of the app after a new deploy — this app is small enough that re-fetching
+// on every load costs nothing, and it removes an entire class of "why isn't my update
+// showing up" confusion.
+const noCache = (req, res, next) => { res.set("Cache-Control", "no-store, no-cache, must-revalidate"); next(); };
+app.use(noCache, express.static(path.join(__dirname, "public"), { etag: false, lastModified: false }));
+app.get("*", noCache, (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 
 const port = process.env.PORT || 3000;
 ensureSchema()
