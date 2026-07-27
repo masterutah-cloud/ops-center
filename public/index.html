@@ -355,6 +355,82 @@ function NewJobModal({ onClose, onCreate }) {
   );
 }
 
+function PageSelectorModal({ sheet, onClose, onSave }) {
+  const [loading, setLoading] = useState(true);
+  const [totalPages, setTotalPages] = useState(sheet.totalPages || 1);
+  const [selected, setSelected] = useState(() => new Set());
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      let count = sheet.totalPages;
+      if (!count) {
+        try { count = (await loadPdfDoc(sheet.url)).numPages; } catch (e) { count = 1; }
+      }
+      if (cancelled) return;
+      setTotalPages(count);
+      const initial = new Set();
+      for (let p = 1; p <= count; p++) if (sheet.pages?.[p]?.included ?? true) initial.add(p);
+      setSelected(initial);
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [sheet.id]);
+
+  const toggle = (p) => setSelected(s => { const n = new Set(s); n.has(p) ? n.delete(p) : n.add(p); return n; });
+  const selectAll = () => setSelected(new Set(Array.from({ length: totalPages }, (_, i) => i + 1)));
+  const clearAll = () => setSelected(new Set());
+
+  const handleSave = () => {
+    const pages = {};
+    for (let p = 1; p <= totalPages; p++) pages[p] = { name: sheet.pages?.[p]?.name || "", included: selected.has(p) };
+    onSave(sheet.id, totalPages, pages);
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center p-4" style={{ background: "rgba(26,35,50,0.6)" }}>
+      <div className="bg-white rounded-sm w-full max-w-xl max-h-[85vh] overflow-hidden flex flex-col">
+        <div className="p-4 border-b flex items-center justify-between" style={{ borderColor: "#EEEDE6" }}>
+          <div>
+            <h3 style={{ fontFamily: "'Oswald', sans-serif" }} className="uppercase font-semibold text-base">Select pages to use</h3>
+            <p className="text-xs mt-0.5" style={{ color: "#8A8577" }}>{sheet.name} — {loading ? "counting pages…" : `${totalPages} pages total, ${selected.size} selected`}</p>
+          </div>
+          <button onClick={onClose}><IX size={18} /></button>
+        </div>
+        {loading ? (
+          <div className="p-8 text-center text-sm flex items-center justify-center gap-2" style={{ color: "#8A8577" }}>
+            <span className="animate-spin"><ILoader size={16} /></span> Reading page count…
+          </div>
+        ) : (
+          <>
+            <div className="flex gap-3 px-4 pt-3">
+              <button onClick={selectAll} className="text-[11px] font-semibold uppercase" style={{ color: "#2B5D8C" }}>Select all</button>
+              <button onClick={clearAll} className="text-[11px] font-semibold uppercase" style={{ color: "#E2600C" }}>Clear all</button>
+              <span className="text-[11px]" style={{ color: "#8A8577" }}>Tip: Clear all, then click just the sheets you actually use.</span>
+            </div>
+            <div className="p-4 overflow-y-auto flex-1 grid grid-cols-10 gap-1.5">
+              {Array.from({ length: totalPages }, (_, i) => i + 1).map(p => (
+                <button key={p} onClick={() => toggle(p)}
+                  className="aspect-square rounded-sm text-xs font-semibold flex items-center justify-center"
+                  style={{ background: selected.has(p) ? "#2B5D8C" : "#EEEDE6", color: selected.has(p) ? "white" : "#5B6470" }}>
+                  {p}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+        <div className="p-4 border-t flex gap-2" style={{ borderColor: "#EEEDE6" }}>
+          <button onClick={onClose} className="flex-1 px-3 py-2 text-sm font-semibold rounded-sm border" style={{ borderColor: "#C9C5B8", color: "#5B6470" }}>Cancel</button>
+          <button onClick={handleSave} disabled={loading} className="flex-1 px-3 py-2 text-sm font-semibold rounded-sm text-white uppercase tracking-wide disabled:opacity-40" style={{ background: "#E2600C" }}>
+            Save selection ({selected.size})
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function JobModal({ job, onClose, onUpdate, onDelete, priceBook }) {
   const [tab, setTab] = useState("details");
   const [newTask, setNewTask] = useState("");
@@ -469,6 +545,11 @@ function JobModal({ job, onClose, onUpdate, onDelete, priceBook }) {
       : s)
   });
   const setSheetTotalPages = (sheetId, totalPages) => update({ takeoffSheets: takeoffSheets.map(s => s.id === sheetId ? { ...s, totalPages } : s) });
+  const setSheetPagesBulk = (sheetId, totalPages, pages) => update({
+    takeoffSheets: takeoffSheets.map(s => s.id === sheetId ? { ...s, totalPages: s.totalPages || totalPages, pages } : s)
+  });
+  const [pageSelectorSheetId, setPageSelectorSheetId] = useState(null);
+  const pageSelectorSheet = takeoffSheets.find(s => s.id === pageSelectorSheetId);
 
   const quantitySummary = useMemo(() => {
     const groups = {};
@@ -703,6 +784,9 @@ function JobModal({ job, onClose, onUpdate, onDelete, priceBook }) {
                         {(s.pixelsPerFoot || Object.keys(s.scales || {}).length) ? "Calibrated" : "Not calibrated"}
                       </span>
                       <button onClick={() => setActiveSheetId(s.id)} className="text-[11px] font-semibold uppercase shrink-0" style={{ color: "#2B5D8C" }}>Open</button>
+                      {((s.type || "").includes("pdf") || (s.name || "").toLowerCase().endsWith(".pdf")) && (
+                        <button onClick={() => setPageSelectorSheetId(s.id)} className="text-[11px] font-semibold uppercase shrink-0" style={{ color: "#8A8577" }}>Select pages</button>
+                      )}
                       <button onClick={() => removeSheet(s.id)}><IX size={14} color="#8A8577" /></button>
                     </div>
                   ))}
@@ -823,6 +907,13 @@ function JobModal({ job, onClose, onUpdate, onDelete, priceBook }) {
           onDeleteClass={deleteClass}
         />
       )}
+      {pageSelectorSheet && (
+        <PageSelectorModal
+          sheet={pageSelectorSheet}
+          onClose={() => setPageSelectorSheetId(null)}
+          onSave={setSheetPagesBulk}
+        />
+      )}
     </div>
   );
 }
@@ -845,7 +936,7 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
   const [currentPage, setCurrentPage] = useState(1);
   const [thumbnails, setThumbnails] = useState({}); // `${sheetId}:${page}` -> dataUrl | "loading" | "error"
   const [pagesPanelOpen, setPagesPanelOpen] = useState(true);
-  const [pagesFilter, setPagesFilter] = useState("all"); // all | inuse
+  const [pagesFilter, setPagesFilter] = useState("inuse"); // all | inuse
   const [selectedMeasurementId, setSelectedMeasurementId] = useState(null);
   const [dragState, setDragState] = useState(null); // { measurementId, pointIndex, x, y }
   const [worksheetOpen, setWorksheetOpen] = useState(false);
@@ -879,12 +970,33 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
     return totals;
   }, [pageMeasurements]);
 
+  const thumbnailProgress = useMemo(() => {
+    let total = 0, done = 0;
+    sheets.forEach(s => {
+      const sIsPdf = (s.type || "").includes("pdf") || (s.name || "").toLowerCase().endsWith(".pdf");
+      if (!sIsPdf) return;
+      const count = s.totalPages || 0;
+      for (let p = 1; p <= count; p++) {
+        if (s.pages?.[p]?.included === false) continue; // excluded pages are never generated — don't count them
+        total++;
+        if (thumbnails[`${s.id}:${p}`]) done++;
+      }
+    });
+    return { total, done };
+  }, [sheets, thumbnails]);
+
   // Ensure every sheet's page count is known, then lazily render a small thumbnail
   // for each PDF page (images are shown directly, no pre-render needed). Runs once
   // per change to the set of sheets, not on every thumbnail — avoids re-triggering itself.
+  // Updates are batched (flushed every few pages, with a yield in between) instead of
+  // one state update per page — with large plan sets (50+ pages) updating on every
+  // single page caused enough back-to-back re-renders that the whole panel felt frozen
+  // and clicks seemed to stop working, even though nothing had actually crashed.
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      let pending = {};
+      const flush = () => { if (Object.keys(pending).length) { setThumbnails(t => ({ ...t, ...pending })); pending = {}; } };
       for (const s of sheets) {
         const sIsPdf = (s.type || "").includes("pdf") || (s.name || "").toLowerCase().endsWith(".pdf");
         let count = s.totalPages;
@@ -896,18 +1008,20 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
           onSetSheetTotalPages(s.id, count);
         }
         if (sIsPdf) {
-          for (let p = 1; p <= Math.min(count, 50); p++) {
+          for (let p = 1; p <= count; p++) {
             const key = `${s.id}:${p}`;
-            if (thumbnails[key]) continue;
-            setThumbnails(t => ({ ...t, [key]: "loading" }));
+            if (thumbnails[key] || pending[key]) continue;
+            if (s.pages?.[p]?.included === false) continue; // user explicitly excluded this page — don't waste time rendering it
             try {
               const { dataUrl } = await renderPdfPageToDataUrl(s.url, p, 0.25);
               if (cancelled) return;
-              setThumbnails(t => ({ ...t, [key]: dataUrl }));
+              pending[key] = dataUrl;
             } catch (e) {
-              if (!cancelled) setThumbnails(t => ({ ...t, [key]: "error" }));
+              pending[key] = "error";
             }
+            if (p % 4 === 0) { flush(); await new Promise(r => setTimeout(r, 0)); } // yield periodically so the UI (clicks, scrolling) stays responsive
           }
+          flush();
         }
       }
     })();
@@ -1209,6 +1323,9 @@ function TakeoffCanvas({ sheets, initialSheetId, measurements, onClose, onSetSca
                 </button>
               ))}
             </div>
+            {thumbnailProgress.total > 0 && thumbnailProgress.done < thumbnailProgress.total && (
+              <div className="text-[9px]" style={{ color: "#8B96A5" }}>Loading previews… {thumbnailProgress.done}/{thumbnailProgress.total}</div>
+            )}
             {sheets.flatMap(s => {
               const sIsPdf = (s.type || "").includes("pdf") || (s.name || "").toLowerCase().endsWith(".pdf");
               const count = s.totalPages || 1;
