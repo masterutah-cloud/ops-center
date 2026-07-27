@@ -90,6 +90,35 @@ app.put("/api/jobs", async (req, res) => {
   }
 });
 
+// GET/PUT /api/pricebook — a shared catalog of item names → unit costs (e.g. "Curb"
+// → $/ft), used by the takeoff tool to turn measured quantities into dollar estimates.
+// Reuses the same ops_data table as jobs, just under a different row id — no new
+// table needed since it's the same "one JSON blob per key" pattern.
+app.get("/api/pricebook", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT data FROM ops_data WHERE id = 'pricebook'");
+    res.json(rows[0]?.data ?? []);
+  } catch (e) {
+    console.error("Failed to load price book:", e);
+    res.status(500).json({ error: "Failed to load price book" });
+  }
+});
+app.put("/api/pricebook", async (req, res) => {
+  const items = req.body;
+  if (!Array.isArray(items)) return res.status(400).json({ error: "Expected an array of items" });
+  try {
+    await pool.query(
+      `INSERT INTO ops_data (id, data, updated_at) VALUES ('pricebook', $1::jsonb, now())
+       ON CONFLICT (id) DO UPDATE SET data = $1::jsonb, updated_at = now()`,
+      [JSON.stringify(items)]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Failed to save price book:", e);
+    res.status(500).json({ error: "Failed to save price book" });
+  }
+});
+
 // POST /api/upload — accepts one file (receipt photo, project photo, or document),
 // uploads it to the configured bucket, and returns its public URL. The frontend
 // stores that URL on the job's expense/file record — the file itself never

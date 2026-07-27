@@ -52,6 +52,19 @@ async function apiSave(jobs) {
   });
   if (!res.ok) throw new Error("save failed: " + res.status);
 }
+async function apiLoadPriceBook() {
+  const res = await fetch("/api/pricebook");
+  if (!res.ok) throw new Error("load failed: " + res.status);
+  return await res.json();
+}
+async function apiSavePriceBook(items) {
+  const res = await fetch("/api/pricebook", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(items),
+  });
+  if (!res.ok) throw new Error("save failed: " + res.status);
+}
 const RETRY_SCHEDULE = [2000, 4000, 8000, 15000];
 
 // ---------- Takeoff geometry (verified separately with unit tests before wiring into the UI) ----------
@@ -73,20 +86,28 @@ function polygonArea(points) {
   return Math.abs(sum) / 2;
 }
 
-// Renders page 1 of a PDF (fetched from its uploaded URL) to a data URL so it can be
-// displayed and measured exactly like an uploaded image. Multi-page plan sets only use
-// page 1 for now — upload each sheet as a separate file if you need more than one page.
-async function renderPdfFirstPageToDataUrl(url) {
+// PDF documents are loaded once and cached by URL, so navigating between pages
+// doesn't re-fetch the whole file — only re-renders the requested page.
+const pdfDocCache = new Map();
+async function loadPdfDoc(url) {
+  if (pdfDocCache.has(url)) return pdfDocCache.get(url);
   if (!window.pdfjsLib) throw new Error("PDF viewer library didn't load — check your connection and reload.");
   window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://unpkg.com/pdfjs-dist@3.11.174/legacy/build/pdf.worker.min.js";
   const pdf = await window.pdfjsLib.getDocument(url).promise;
-  const page = await pdf.getPage(1);
+  pdfDocCache.set(url, pdf);
+  return pdf;
+}
+// Renders a specific page (1-indexed) of a PDF to a data URL for display/measuring,
+// and returns the total page count so the UI can offer page navigation.
+async function renderPdfPageToDataUrl(url, pageNum) {
+  const pdf = await loadPdfDoc(url);
+  const page = await pdf.getPage(pageNum);
   const viewport = page.getViewport({ scale: 2 });
   const canvas = document.createElement("canvas");
   canvas.width = viewport.width;
   canvas.height = viewport.height;
   await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-  return canvas.toDataURL("image/png");
+  return { dataUrl: canvas.toDataURL("image/png"), numPages: pdf.numPages };
 }
 
 const EXPENSE_CATEGORIES = ["Labor", "Materials", "Other"];
@@ -193,6 +214,66 @@ function JobCard({ job, onOpen }) {
   );
 }
 
+function PriceBookModal({ items, onChange, onClose }) {
+  const [form, setForm] = useState({ name: "", unit: "ft", unitCost: "" });
+
+  const addItem = () => {
+    if (!form.name.trim() || !form.unitCost) return;
+    onChange([...items, { id: uid(), name: form.name.trim(), unit: form.unit, unitCost: Number(form.unitCost) || 0 }]);
+    setForm({ name: "", unit: "ft", unitCost: "" });
+  };
+  const removeItem = (id) => onChange(items.filter(i => i.id !== id));
+  const updateItem = (id, patch) => onChange(items.map(i => i.id === id ? { ...i, ...patch } : i));
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(26,35,50,0.55)" }}>
+      <div className="bg-white rounded-sm w-full max-w-lg max-h-[85vh] overflow-hidden flex flex-col">
+        <div className="p-4 border-b flex items-center justify-between" style={{ borderColor: "#EEEDE6" }}>
+          <div>
+            <h3 style={{ fontFamily: "'Oswald', sans-serif" }} className="uppercase font-semibold text-base">Price book</h3>
+            <p className="text-xs mt-0.5" style={{ color: "#8A8577" }}>Shared across all jobs — used in the Takeoff tool to turn measured quantities into dollar costs.</p>
+          </div>
+          <button onClick={onClose}><IX size={18} /></button>
+        </div>
+        <div className="p-4 overflow-y-auto flex-1">
+          <div className="grid grid-cols-4 gap-2 mb-4">
+            <input value={form.name} onChange={(e) => setForm(f => ({ ...f, name: e.target.value }))} placeholder="Item name (e.g. Curb)"
+              className="col-span-2 px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+            <select value={form.unit} onChange={(e) => setForm(f => ({ ...f, unit: e.target.value }))}
+              className="px-2.5 py-2 border rounded-sm text-sm bg-white" style={{ borderColor: "#C9C5B8" }}>
+              <option value="ft">$/ft</option>
+              <option value="sq ft">$/sq ft</option>
+              <option value="count">$/each</option>
+            </select>
+            <input type="number" value={form.unitCost} onChange={(e) => setForm(f => ({ ...f, unitCost: e.target.value }))} placeholder="Cost"
+              className="px-2.5 py-2 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+          </div>
+          <button onClick={addItem} className="w-full py-2 rounded-sm text-white text-xs font-semibold uppercase tracking-wide mb-4" style={{ background: "#2B5D8C" }}>Add item</button>
+
+          {items.length === 0 ? (
+            <EmptyState icon={IDollar} title="No items yet" subtitle="Add unit costs for the materials/labor items you measure most often." />
+          ) : (
+            <div className="space-y-1.5">
+              {items.map(i => (
+                <div key={i.id} className="flex items-center gap-2 px-2.5 py-2 border rounded-sm" style={{ borderColor: "#EEEDE6" }}>
+                  <input value={i.name} onChange={(e) => updateItem(i.id, { name: e.target.value })} className="flex-1 min-w-0 px-2 py-1 border rounded-sm text-sm" style={{ borderColor: "#EEEDE6" }} />
+                  <select value={i.unit} onChange={(e) => updateItem(i.id, { unit: e.target.value })} className="px-2 py-1 border rounded-sm text-sm bg-white" style={{ borderColor: "#EEEDE6" }}>
+                    <option value="ft">$/ft</option>
+                    <option value="sq ft">$/sq ft</option>
+                    <option value="count">$/each</option>
+                  </select>
+                  <input type="number" value={i.unitCost} onChange={(e) => updateItem(i.id, { unitCost: Number(e.target.value) || 0 })} className="w-20 px-2 py-1 border rounded-sm text-sm" style={{ borderColor: "#EEEDE6" }} />
+                  <button onClick={() => removeItem(i.id)}><IX size={14} color="#8A8577" /></button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function NewJobModal({ onClose, onCreate }) {
   const [form, setForm] = useState({ name: "", client: "", address: "", status: "Estimate", startDate: todayStr(), dueDate: "", estimateAmount: "" });
   const set = (k) => (e) => setForm(f => ({ ...f, [k]: e.target.value }));
@@ -244,7 +325,7 @@ function NewJobModal({ onClose, onCreate }) {
   );
 }
 
-function JobModal({ job, onClose, onUpdate, onDelete }) {
+function JobModal({ job, onClose, onUpdate, onDelete, priceBook }) {
   const [tab, setTab] = useState("details");
   const [newTask, setNewTask] = useState("");
   const [newTaskAssignee, setNewTaskAssignee] = useState("");
@@ -327,7 +408,7 @@ function JobModal({ job, onClose, onUpdate, onDelete }) {
     setUploadError(""); setUploadingSheet(true);
     try {
       const uploaded = await apiUpload(file);
-      update({ takeoffSheets: [...takeoffSheets, { ...uploaded, id: uid(), pixelsPerFoot: null }] });
+      update({ takeoffSheets: [...takeoffSheets, { ...uploaded, id: uid(), scales: {} }] });
     } catch (e) {
       setUploadError(e.message || "Couldn't upload that sheet.");
     } finally {
@@ -339,7 +420,7 @@ function JobModal({ job, onClose, onUpdate, onDelete }) {
     update({ takeoffSheets: takeoffSheets.filter(s => s.id !== id), takeoffMeasurements: takeoffMeasurements.filter(m => m.sheetId !== id) });
     if (s?.key) { try { await fetch("/api/upload/" + s.key, { method: "DELETE" }); } catch (e) {} }
   };
-  const setSheetScale = (sheetId, pixelsPerFoot) => update({ takeoffSheets: takeoffSheets.map(s => s.id === sheetId ? { ...s, pixelsPerFoot } : s) });
+  const setSheetScale = (sheetId, page, pixelsPerFoot) => update({ takeoffSheets: takeoffSheets.map(s => s.id === sheetId ? { ...s, scales: { ...(s.scales || {}), [page]: pixelsPerFoot } } : s) });
   const saveMeasurement = (m) => update({ takeoffMeasurements: [...takeoffMeasurements, m] });
   const deleteMeasurement = (id) => update({ takeoffMeasurements: takeoffMeasurements.filter(m => m.id !== id) });
 
@@ -350,8 +431,20 @@ function JobModal({ job, onClose, onUpdate, onDelete }) {
       groups[key] = groups[key] || { label: m.label, unit: m.unit, total: 0 };
       groups[key].total += Number(m.value) || 0;
     });
-    return Object.values(groups);
-  }, [takeoffMeasurements]);
+    return Object.values(groups).map(g => {
+      const priceItem = (priceBook || []).find(p => p.name.toLowerCase() === g.label.toLowerCase() && p.unit === g.unit);
+      return { ...g, unitCost: priceItem?.unitCost ?? null, cost: priceItem ? g.total * priceItem.unitCost : null };
+    });
+  }, [takeoffMeasurements, priceBook]);
+
+  const sendQuantityToExpenses = (q) => {
+    update({
+      expenses: [...(job.expenses || []), {
+        id: uid(), category: "Materials", description: `${q.label} (${q.total.toLocaleString()} ${q.unit} from takeoff)`,
+        amount: Math.round(q.cost * 100) / 100, date: todayStr(), receipt: null,
+      }],
+    });
+  };
 
   const expenseTotals = useMemo(() => {
     const list = job.expenses || [];
@@ -560,8 +653,8 @@ function JobModal({ job, onClose, onUpdate, onDelete }) {
                     <div key={s.id} className="flex items-center gap-2 px-2.5 py-2 border rounded-sm" style={{ borderColor: "#EEEDE6" }}>
                       <IFile size={14} color="#8A8577" />
                       <span className="flex-1 text-sm truncate">{s.name}</span>
-                      <span className="text-[10px] uppercase px-1.5 py-0.5 rounded-sm shrink-0" style={{ background: s.pixelsPerFoot ? "#E8F3EC" : "#FBEAE0", color: s.pixelsPerFoot ? "#4A7856" : "#B4460A" }}>
-                        {s.pixelsPerFoot ? "Calibrated" : "Not calibrated"}
+                      <span className="text-[10px] uppercase px-1.5 py-0.5 rounded-sm shrink-0" style={{ background: (s.pixelsPerFoot || Object.keys(s.scales || {}).length) ? "#E8F3EC" : "#FBEAE0", color: (s.pixelsPerFoot || Object.keys(s.scales || {}).length) ? "#4A7856" : "#B4460A" }}>
+                        {(s.pixelsPerFoot || Object.keys(s.scales || {}).length) ? "Calibrated" : "Not calibrated"}
                       </span>
                       <button onClick={() => setActiveSheetId(s.id)} className="text-[11px] font-semibold uppercase shrink-0" style={{ color: "#2B5D8C" }}>Open</button>
                       <button onClick={() => removeSheet(s.id)}><IX size={14} color="#8A8577" /></button>
@@ -578,8 +671,17 @@ function JobModal({ job, onClose, onUpdate, onDelete }) {
                   <div className="mt-2 space-y-1">
                     {quantitySummary.map(q => (
                       <div key={q.label + q.unit} className="flex items-center justify-between text-sm px-2.5 py-1.5 border-b" style={{ borderColor: "#EEEDE6" }}>
-                        <span>{q.label}</span>
-                        <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{q.total.toLocaleString()} {q.unit}</span>
+                        <span className="flex-1 min-w-0 truncate">{q.label}</span>
+                        <span style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="shrink-0">{q.total.toLocaleString()} {q.unit}</span>
+                        {q.cost != null ? (
+                          <>
+                            <span style={{ fontFamily: "'IBM Plex Mono', monospace", color: "#4A7856" }} className="shrink-0 ml-3">{fmtMoney(q.cost)}</span>
+                            <button onClick={() => sendQuantityToExpenses(q)} title="Add this cost to Materials expenses"
+                              className="shrink-0 ml-2 text-[10px] font-semibold uppercase" style={{ color: "#2B5D8C" }}>+ Expense</button>
+                          </>
+                        ) : (
+                          <span className="shrink-0 ml-3 text-[10px]" style={{ color: "#C9C5B8" }}>no price set</span>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -661,16 +763,17 @@ function JobModal({ job, onClose, onUpdate, onDelete }) {
           sheet={activeSheet}
           measurements={takeoffMeasurements.filter(m => m.sheetId === activeSheet.id)}
           onClose={() => setActiveSheetId(null)}
-          onSetScale={(px) => setSheetScale(activeSheet.id, px)}
+          onSetScale={(page, px) => setSheetScale(activeSheet.id, page, px)}
           onSaveMeasurement={saveMeasurement}
           onDeleteMeasurement={deleteMeasurement}
+          priceBook={priceBook}
         />
       )}
     </div>
   );
 }
 
-function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasurement, onDeleteMeasurement }) {
+function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasurement, onDeleteMeasurement, priceBook }) {
   const [imgError, setImgError] = useState("");
   const [imgReady, setImgReady] = useState(false);
   const [naturalW, setNaturalW] = useState(0);
@@ -682,19 +785,35 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
   const [calibrationFeet, setCalibrationFeet] = useState("");
   const [labelForm, setLabelForm] = useState(null); // { type, valuePx, points }
   const [labelText, setLabelText] = useState("");
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+
+  const isPdf = (sheet.type || "").includes("pdf") || (sheet.name || "").toLowerCase().endsWith(".pdf");
+  // Scale is stored per page, since different sheets in a multi-page plan set are
+  // often at different scales — falls back to a legacy single pixelsPerFoot value
+  // (from before multi-page support) for page 1 only.
+  const currentScale = sheet.scales?.[currentPage] ?? (currentPage === 1 ? sheet.pixelsPerFoot : undefined);
+  const pageMeasurements = measurements.filter(m => (m.page || 1) === currentPage);
 
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
   const imgElRef = useRef(null);
 
-  // Load the sheet — render PDFs to an image first, use uploaded images directly.
+  // Load the current page — render PDFs to an image first, use uploaded images directly.
   useEffect(() => {
     let cancelled = false;
-    setImgReady(false); setImgError("");
+    setImgReady(false); setImgError(""); setMode(null); setPoints([]);
     (async () => {
       try {
-        const isPdf = (sheet.type || "").includes("pdf") || (sheet.name || "").toLowerCase().endsWith(".pdf");
-        const src = isPdf ? await renderPdfFirstPageToDataUrl(sheet.url) : sheet.url;
+        let src;
+        if (isPdf) {
+          const result = await renderPdfPageToDataUrl(sheet.url, currentPage);
+          if (cancelled) return;
+          setTotalPages(result.numPages);
+          src = result.dataUrl;
+        } else {
+          src = sheet.url;
+        }
         const img = new Image();
         img.onload = () => {
           if (cancelled) return;
@@ -711,7 +830,7 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
       }
     })();
     return () => { cancelled = true; };
-  }, [sheet.id, sheet.url]);
+  }, [sheet.id, sheet.url, currentPage]);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current, img = imgElRef.current;
@@ -746,18 +865,37 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
       }
     };
 
-    measurements.forEach(m => drawShape(m.points, m.type, "#2B5D8C", `${m.label} (${m.value} ${m.unit})`));
+    pageMeasurements.forEach(m => drawShape(m.points, m.type, "#2B5D8C", `${m.label} (${m.value} ${m.unit})`));
     if (points.length) drawShape(points, mode === "calibrate" ? "line" : mode, "#E2600C", null);
     if (pendingCalibration) drawShape(pendingCalibration.points, "line", "#E2600C", null);
     ctx.restore();
-  }, [naturalW, naturalH, zoom, points, mode, measurements, pendingCalibration]);
+  }, [naturalW, naturalH, zoom, points, mode, pageMeasurements, pendingCalibration]);
 
   useEffect(() => { if (imgReady) draw(); }, [imgReady, draw]);
+
+  // Snaps a raw click to a nearby existing vertex (from saved measurements on this page,
+  // or points already placed in the shape being drawn) so connected runs — e.g. a curb
+  // line continuing where the last one ended — line up exactly instead of by eye.
+  const SNAP_SCREEN_PX = 10;
+  const findSnapPoint = (x, y) => {
+    const thresholdNatural = SNAP_SCREEN_PX / zoom;
+    const candidates = [];
+    pageMeasurements.forEach(m => candidates.push(...m.points));
+    candidates.push(...points);
+    let best = null, bestDist = thresholdNatural;
+    candidates.forEach(p => {
+      const d = Math.hypot(p.x - x, p.y - y);
+      if (d < bestDist) { bestDist = d; best = p; }
+    });
+    return best;
+  };
 
   const handleClick = (e) => {
     if (!mode || labelForm || pendingCalibration) return;
     const rect = canvasRef.current.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / zoom, y = (e.clientY - rect.top) / zoom;
+    const rawX = (e.clientX - rect.left) / zoom, rawY = (e.clientY - rect.top) / zoom;
+    const snap = findSnapPoint(rawX, rawY);
+    const { x, y } = snap || { x: rawX, y: rawY };
     if (mode === "calibrate") {
       const next = [...points, { x, y }];
       if (next.length === 2) { setPendingCalibration({ points: next, distancePx: polylineLength(next) }); setPoints([]); }
@@ -770,8 +908,10 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
   const minPoints = mode === "area" ? 3 : mode === "count" ? 1 : 2;
   const canFinish = mode && mode !== "calibrate" && points.length >= minPoints;
 
+  const priceMatch = labelForm ? (priceBook || []).find(p => p.name.toLowerCase() === labelText.trim().toLowerCase() && p.unit === (labelForm.type === "line" ? "ft" : labelForm.type === "area" ? "sq ft" : "count")) : null;
+
   const handleFinish = () => {
-    if (mode !== "count" && !sheet.pixelsPerFoot) { alert("Calibrate this sheet's scale first (use the Calibrate tool)."); return; }
+    if (mode !== "count" && !currentScale) { alert("Calibrate this sheet's scale first (use the Calibrate tool)."); return; }
     const valuePx = mode === "area" ? polygonArea(points) : mode === "line" ? polylineLength(points) : points.length;
     setLabelForm({ type: mode, valuePx, points });
     setLabelText("");
@@ -781,17 +921,18 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
   const confirmLabel = () => {
     if (!labelText.trim()) return;
     let value, unit;
-    if (labelForm.type === "line") { value = Math.round((labelForm.valuePx / sheet.pixelsPerFoot) * 10) / 10; unit = "ft"; }
-    else if (labelForm.type === "area") { value = Math.round((labelForm.valuePx / (sheet.pixelsPerFoot ** 2)) * 10) / 10; unit = "sq ft"; }
+    if (labelForm.type === "line") { value = Math.round((labelForm.valuePx / currentScale) * 10) / 10; unit = "ft"; }
+    else if (labelForm.type === "area") { value = Math.round((labelForm.valuePx / (currentScale ** 2)) * 10) / 10; unit = "sq ft"; }
     else { value = labelForm.valuePx; unit = "count"; }
-    onSaveMeasurement({ id: uid(), sheetId: sheet.id, sheetName: sheet.name, type: labelForm.type, label: labelText.trim(), value, unit, points: labelForm.points });
+    const sheetName = totalPages > 1 ? `${sheet.name} (p${currentPage})` : sheet.name;
+    onSaveMeasurement({ id: uid(), sheetId: sheet.id, sheetName, page: currentPage, type: labelForm.type, label: labelText.trim(), value, unit, points: labelForm.points });
     setLabelForm(null); setPoints([]); setMode(null);
   };
 
   const confirmCalibration = () => {
     const feet = Number(calibrationFeet);
     if (!feet || feet <= 0) return;
-    onSetScale(pendingCalibration.distancePx / feet);
+    onSetScale(currentPage, pendingCalibration.distancePx / feet);
     setPendingCalibration(null); setCalibrationFeet(""); setMode(null);
   };
 
@@ -808,14 +949,23 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
       <div className="flex items-center justify-between px-4 py-2.5 shrink-0">
         <div className="text-white text-sm font-semibold truncate pr-3">{sheet.name}</div>
         <div className="flex items-center gap-2 shrink-0">
-          <span className="text-[11px]" style={{ color: sheet.pixelsPerFoot ? "#8BD1A8" : "#E8B23D" }}>
-            {sheet.pixelsPerFoot ? "Scale set" : "Not calibrated"}
+          <span className="text-[11px]" style={{ color: currentScale ? "#8BD1A8" : "#E8B23D" }}>
+            {currentScale ? "Scale set" : "Not calibrated"}
           </span>
           <button onClick={onClose} className="text-white p-1"><IX size={20} /></button>
         </div>
       </div>
 
       <div className="flex flex-wrap items-center gap-2 px-4 pb-2.5 shrink-0">
+        {totalPages > 1 && (
+          <div className="flex items-center gap-1 mr-1">
+            <button onClick={() => setCurrentPage(p => Math.max(1, p - 1))} disabled={currentPage === 1}
+              className="px-2 py-1 rounded-sm text-white text-xs disabled:opacity-30" style={{ background: "#2B5D8C" }}>‹</button>
+            <span className="text-[11px] text-white px-1">Page {currentPage} / {totalPages}</span>
+            <button onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}
+              className="px-2 py-1 rounded-sm text-white text-xs disabled:opacity-30" style={{ background: "#2B5D8C" }}>›</button>
+          </div>
+        )}
         {toolBtn("calibrate", "Calibrate", IRuler)}
         {toolBtn("line", "Line", IRuler)}
         {toolBtn("area", "Area", IGrid)}
@@ -849,13 +999,25 @@ function TakeoffCanvas({ sheet, measurements, onClose, onSetScale, onSaveMeasure
         </div>
       )}
       {labelForm && (
-        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-white rounded-sm p-3 shadow-lg flex items-center gap-2">
-          <span className="text-xs" style={{ color: "#5B6470" }}>Label this {labelForm.type}:</span>
-          <input autoFocus value={labelText} onChange={(e) => setLabelText(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && confirmLabel()} placeholder="e.g. Curb, Concrete pad, Trees"
-            className="w-44 px-2 py-1 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
-          <button onClick={confirmLabel} className="px-2.5 py-1 rounded-sm text-white text-xs font-semibold" style={{ background: "#4A7856" }}>Save</button>
-          <button onClick={() => { setLabelForm(null); setPoints([]); setMode(null); }}><IX size={14} color="#8A8577" /></button>
+        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-white rounded-sm p-3 shadow-lg flex flex-col gap-1.5">
+          <div className="flex items-center gap-2">
+            <span className="text-xs" style={{ color: "#5B6470" }}>Label this {labelForm.type}:</span>
+            <input autoFocus value={labelText} onChange={(e) => setLabelText(e.target.value)} list="pricebook-names"
+              onKeyDown={(e) => e.key === "Enter" && confirmLabel()} placeholder="e.g. Curb, Concrete pad, Trees"
+              className="w-44 px-2 py-1 border rounded-sm text-sm" style={{ borderColor: "#C9C5B8" }} />
+            <datalist id="pricebook-names">
+              {(priceBook || []).map(p => <option key={p.id} value={p.name} />)}
+            </datalist>
+            <button onClick={confirmLabel} className="px-2.5 py-1 rounded-sm text-white text-xs font-semibold" style={{ background: "#4A7856" }}>Save</button>
+            <button onClick={() => { setLabelForm(null); setPoints([]); setMode(null); }}><IX size={14} color="#8A8577" /></button>
+          </div>
+          {labelText.trim() && (
+            <div className="text-[11px]" style={{ color: priceMatch ? "#4A7856" : "#8A8577" }}>
+              {priceMatch
+                ? `Matches price book — ${fmtMoney(priceMatch.unitCost)}/${priceMatch.unit} → est. ${fmtMoney((labelForm.type === "line" ? labelForm.valuePx / currentScale : labelForm.type === "area" ? labelForm.valuePx / (currentScale ** 2) : labelForm.valuePx) * priceMatch.unitCost)}`
+                : "No price book match — will save without a cost"}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -900,6 +1062,8 @@ function OpsCenterInner() {
   const [selectedId, setSelectedId] = useState(null);
   const [showNew, setShowNew] = useState(false);
   const [taskFilter, setTaskFilter] = useState("open");
+  const [priceBook, setPriceBook] = useState([]);
+  const [showPriceBook, setShowPriceBook] = useState(false);
   const pendingRef = useRef(null);
   const retryTimerRef = useRef(null);
   const attemptRef = useRef(0);
@@ -920,8 +1084,14 @@ function OpsCenterInner() {
 
   useEffect(() => {
     runLoad();
+    (async () => { try { setPriceBook(await apiLoadPriceBook()); } catch (e) { /* price book is a nice-to-have; fail quietly, still empty */ } })();
     return () => { if (retryTimerRef.current) clearTimeout(retryTimerRef.current); };
   }, [runLoad]);
+
+  const updatePriceBook = async (next) => {
+    setPriceBook(next);
+    try { await apiSavePriceBook(next); } catch (e) { /* best-effort; price book isn't safety-critical data */ }
+  };
 
   const attemptSave = useCallback(async (data) => {
     pendingRef.current = data;
@@ -1039,6 +1209,7 @@ function OpsCenterInner() {
             <button onClick={handleExport} title="Download a backup of all job data" className="p-2 rounded-sm hover:bg-white/10" style={{ color: "#8B96A5" }}><IDownload size={15} /></button>
             <button onClick={() => fileInputRef.current?.click()} title="Restore job data from a backup file" className="p-2 rounded-sm hover:bg-white/10" style={{ color: "#8B96A5" }}><IUpload size={15} /></button>
             <input type="file" accept="application/json" ref={fileInputRef} onChange={handleImportFile} className="hidden" />
+            <button onClick={() => setShowPriceBook(true)} title="Manage item price book" className="p-2 rounded-sm hover:bg-white/10" style={{ color: "#8B96A5" }}><IDollar size={15} /></button>
             <button onClick={() => setShowNew(true)} disabled={loadStatus === "error"}
               className="flex items-center gap-1.5 px-3 py-2 rounded-sm text-white text-xs font-semibold uppercase tracking-wide disabled:opacity-40" style={{ background: "#E2600C" }}>
               <IPlus size={14} /> New job
@@ -1163,7 +1334,8 @@ function OpsCenterInner() {
         )}
       </div>
 
-      {selectedJob && <JobModal job={selectedJob} onClose={() => setSelectedId(null)} onUpdate={updateJob} onDelete={deleteJob} />}
+      {selectedJob && <JobModal job={selectedJob} onClose={() => setSelectedId(null)} onUpdate={updateJob} onDelete={deleteJob} priceBook={priceBook} />}
+      {showPriceBook && <PriceBookModal items={priceBook} onChange={updatePriceBook} onClose={() => setShowPriceBook(false)} />}
       {showNew && <NewJobModal onClose={() => setShowNew(false)} onCreate={addJob} />}
     </div>
   );
